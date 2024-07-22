@@ -1,7 +1,6 @@
 import pytest
 import tiktoken
 import os
-
 from batchbpe import BatchTokenizer
 
 # -----------------------------------------------------------------------------
@@ -97,6 +96,8 @@ def test_save_load(special_tokens):
     tokenizer.train(text, 256 + 64)
     tokenizer.register_special_tokens(special_tokens)
     # verify that decode(encode(x)) == x
+    test = tokenizer.decode(tokenizer.encode(text, "all"))
+    print(f'test: {test}\n\ntext: {text}')
     assert tokenizer.decode(tokenizer.encode(text, "all")) == text
     # verify that save/load work as expected
     ids = tokenizer.encode(text, "all")
@@ -112,11 +113,6 @@ def test_save_load(special_tokens):
     # delete the temporary files
     for file in ["test_tokenizer_tmp.model", "test_tokenizer_tmp.vocab"]:
         os.remove(file)
-
-def test_max_batch_size_tuning():
-    # test that the max_batch_size can be tuned
-    tokenizer = BatchTokenizer(max_batch_size=16)
-    assert tokenizer.max_batch_size == 16
 
 # TODO: make this equivalency test a standalone script that compares two tokenizers
 # def test_batch_regex_equivalent():

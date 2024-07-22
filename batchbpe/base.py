@@ -27,6 +27,22 @@ GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1
 # -----------------------------------------------------------------------------
 # a few helper functions
 
+def merge(ids, pair, idx, len_ids):
+    """
+    In the list of integers (ids), replace all consecutive occurrences
+    of pair with the new integer token idx
+    Example: ids=[1, 2, 3, 1, 2], pair=(1, 2), idx=4 -> [4, 3, 4]
+    """
+    i = 0
+    while i + 1 < len_ids:
+        j = i + 1
+        if ids[i] == pair[0] and ids[j] == pair[1]:
+            ids[i] = idx
+            del ids[j]
+            len_ids -= 1
+        i = j
+    return len_ids
+
 def replace_control_characters(s: str) -> str:
     # we don't want to print control characters
     # which distort the output (e.g. \n or much worse)
@@ -306,7 +322,10 @@ class Tokenizer:
 
     def encode_ordinary(self, text):
         """Encoding that ignores any special tokens."""
-        return [*map(self._encode_chunk, re.findall(self.compiled_pattern, text))]
+        ids = []
+        for chunk in re.findall(self.compiled_pattern, text):
+            ids.extend(self._encode_chunk(chunk))
+        return ids
 
     def encode(self, text, allowed_special="none_raise"):
         """

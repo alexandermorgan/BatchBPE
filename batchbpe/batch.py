@@ -59,23 +59,7 @@ def merge_batch(ids, pairs):
                 last_index -= 1
             i = j
 
-def merge(ids, pair, idx, len_ids):
-    """
-    In the list of integers (ids), replace all consecutive occurrences
-    of pair with the new integer token idx
-    Example: ids=[1, 2, 3, 1, 2], pair=(1, 2), idx=4 -> [4, 3, 4]
-    """
-    i = 0
-    while i + 1 < len_ids:
-        j = i + 1
-        if ids[i] == pair[0] and ids[j] == pair[1]:
-            ids[i] = idx
-            del ids[j]
-            len_ids -= 1
-        i = j
-    return len_ids
-
-class MultiplierTokenizer(Tokenizer):
+class BatchTokenizer(Tokenizer):
     def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0):
         """
         - pattern: optional string to override the default (GPT-4 split pattern)
