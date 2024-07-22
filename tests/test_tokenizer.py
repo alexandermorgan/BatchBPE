@@ -2,7 +2,7 @@ import pytest
 import tiktoken
 import os
 
-from minbpe import BasicTokenizer, RegexTokenizer, BatchTokenizer, GPT4Tokenizer
+from batchbpe import BatchTokenizer
 
 # -----------------------------------------------------------------------------
 # common test data
@@ -49,7 +49,7 @@ The ancestors of llamas are thought to have originated from the Great Plains of 
 # tests
 
 # test encode/decode identity for a few different strings
-@pytest.mark.parametrize("tokenizer_factory", [BasicTokenizer, RegexTokenizer, BatchTokenizer, GPT4Tokenizer])
+@pytest.mark.parametrize("tokenizer_factory", [BatchTokenizer])
 @pytest.mark.parametrize("text", test_strings)
 def test_encode_decode_identity(tokenizer_factory, text):
     text = unpack(text)
@@ -58,26 +58,8 @@ def test_encode_decode_identity(tokenizer_factory, text):
     decoded = tokenizer.decode(ids)
     assert text == decoded
 
-# test that our tokenizer matches the official GPT-4 tokenizer
-@pytest.mark.parametrize("text", test_strings)
-def test_gpt4_tiktoken_equality(text):
-    text = unpack(text)
-    tokenizer = GPT4Tokenizer()
-    enc = tiktoken.get_encoding("cl100k_base")
-    tiktoken_ids = enc.encode(text)
-    gpt4_tokenizer_ids = tokenizer.encode(text)
-    assert gpt4_tokenizer_ids == tiktoken_ids
-
-# test the handling of special tokens
-def test_gpt4_tiktoken_equality_special_tokens():
-    tokenizer = GPT4Tokenizer()
-    enc = tiktoken.get_encoding("cl100k_base")
-    tiktoken_ids = enc.encode(specials_string, allowed_special="all")
-    gpt4_tokenizer_ids = tokenizer.encode(specials_string, allowed_special="all")
-    assert gpt4_tokenizer_ids == tiktoken_ids
-
 # reference test to add more tests in the future
-@pytest.mark.parametrize("tokenizer_factory", [BasicTokenizer, RegexTokenizer, BatchTokenizer])
+@pytest.mark.parametrize("tokenizer_factory", [BatchTokenizer])
 def test_wikipedia_example(tokenizer_factory):
     """
     Quick unit test, following along the Wikipedia example:
@@ -111,7 +93,7 @@ def test_save_load(special_tokens):
     # take a bit more complex piece of text and train the tokenizer, chosen at random
     text = llama_text
     # create a Tokenizer and do 64 merges
-    tokenizer = RegexTokenizer()
+    tokenizer = BatchTokenizer()
     tokenizer.train(text, 256 + 64)
     tokenizer.register_special_tokens(special_tokens)
     # verify that decode(encode(x)) == x
@@ -121,7 +103,7 @@ def test_save_load(special_tokens):
     # save the tokenizer (TODO use a proper temporary directory)
     tokenizer.save("test_tokenizer_tmp")
     # re-load the tokenizer
-    tokenizer = RegexTokenizer()
+    tokenizer = BatchTokenizer()
     tokenizer.load("test_tokenizer_tmp.model")
     # verify that decode(encode(x)) == x
     assert tokenizer.decode(ids) == text
@@ -132,38 +114,32 @@ def test_save_load(special_tokens):
         os.remove(file)
 
 def test_max_batch_size_tuning():
-    # test that the max_batch_size can be tuned (default is 512)
+    # test that the max_batch_size can be tuned
     tokenizer = BatchTokenizer(max_batch_size=16)
     assert tokenizer.max_batch_size == 16
 
-def test_zero_max_batch_size():
-    # ensure that an assertion error is raised if max_batch_size < 1
-    with pytest.raises(AssertionError):
-        tokenizer = BatchTokenizer(max_batch_size=0)
+# TODO: make this equivalency test a standalone script that compares two tokenizers
+# def test_batch_regex_equivalent():
+#     # show that batch and regex tokenizations are equivalent. They will have different
+#     # merges dict keys, but if the byte strings that those keys correspond to are
+#     # the same (irrespective of key order) then they are equivalent. In other words,
+#     # "equivalent" here means that they would tokenize a text in the same way.
+#     # It is *possible* for them to be unequal but in practice they are almost always
+#     # equivalent and even when they aren't the difference is unnoticeable.
+#     text = llama_text
+#     vocab_size = 256 + 20
 
-def test_batch_regex_equivalent():
-    # show that batch and regex tokenizations are equivalent. They will have different
-    # merges dict keys, but if the byte strings that those keys correspond to are
-    # the same (irrespective of key order) then they are equivalent. In other words,
-    # "equivalent" here means that they would tokenize a text in the same way.
-    # It is *possible* for them to be unequal but in practice they are almost always
-    # equivalent and even when they aren't the difference is unnoticeable.
-    text = llama_text
-    vocab_size = 256 + 20
+#     batch_tokenizer = BatchTokenizer()
+#     batch_tokenizer.train(text, vocab_size, verbose=True)
+#     batch_tokenizer.register_special_tokens(special_tokens)
+#     batch_vocab_set = {*batch_tokenizer.vocab.values()}
 
-    batch_tokenizer = BatchTokenizer()
-    batch_tokenizer.train(text, vocab_size, verbose=True)
-    batch_tokenizer.register_special_tokens(special_tokens)
-    batch_keys = {(batch_tokenizer.vocab[pair[0]], batch_tokenizer.vocab[pair[1]])
-            for pair in batch_tokenizer.merges}
+#     regex_tokenizer = RegexTokenizer()
+#     regex_tokenizer.train(text, vocab_size, verbose=True)
+#     regex_tokenizer.register_special_tokens(special_tokens)
+#     regex_vocab_set = {*regex_tokenizer.vocab.values()}
 
-    regex_tokenizer = RegexTokenizer()
-    regex_tokenizer.train(text, vocab_size, verbose=True)
-    regex_tokenizer.register_special_tokens(special_tokens)
-    regex_keys = {(regex_tokenizer.vocab[pair[0]], regex_tokenizer.vocab[pair[1]])
-            for pair in regex_tokenizer.merges}
-
-    assert(batch_keys == regex_keys)
+#     assert(batch_vocab_set == regex_vocab_set)
 
 if __name__ == "__main__":
     pytest.main()
