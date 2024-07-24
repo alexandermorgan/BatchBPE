@@ -1,28 +1,28 @@
-# minbpe
+# BatchBPE
 
-Minimal, clean code for the (byte-level) Byte Pair Encoding (BPE) algorithm commonly used in LLM tokenization. The BPE algorithm is "byte-level" because it runs on UTF-8 encoded strings.
+Practical performant pure python implementation of the (byte-level) Byte Pair Encoding (BPE) algorithm commonly used in LLM tokenization. The BPE algorithm is "byte-level" because it runs on UTF-8 encoded strings. "Batch" is for the most characteristic aspect of BatchBPE, which is that it executes token-pair merges safely in batches. ~200 is the average batch size when building a ~50k token vocabulary.
 
-This algorithm was popularized for LLMs by the [GPT-2 paper](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) and the associated GPT-2 [code release](https://github.com/openai/gpt-2) from OpenAI. [Sennrich et al. 2015](https://arxiv.org/abs/1508.07909) is cited as the original reference for the use of BPE in NLP applications. Today, all modern LLMs (e.g. GPT, Llama, Mistral) use this algorithm to train their tokenizers.
+This repo is a fork of Andrej Karpathy's excellent introduction to the BPE used for LLM tokenization. If you're new to the subject but haven't reviewed Karpathy's resources, definitely start there. He has a [2-hour video](), accompanying [minbpe github repo], and a [colab notebook](). I highly recommend all three. Tokenization is deceptively simple, so a deep dive into the topic is definitely worth it even if you can understand the basics of it with a 60-second description.
 
-There are three Tokenizers in this repository, all of which can perform the 3 primary functions of a Tokenizer: 1) train the tokenizer vocabulary and merges on a given text, 2) encode from text to tokens, 3) decode from tokens to text. The files of the repo are as follows:
+This BatchBPE began as a PR for minbpe but developed to the point where the objective changed. Instead of minbpe's pedagogic purpose, BatchBPE aims to be as practical and easy to modify as possible. The goal is to make it easy for people to try out new tokenization ideas even if they're working with limited compute, memory, or hard-disk resources. A lot of making tokenization more accessible boils down to compute and memory optimizations. Using BatchBPE's fastest combination of settings (described below), you can train a GPT2-sized vocabulary (~50k tokens) on 1GB's worth of text in well under a minute on a 4-year old laptop. So yes, trying out new tokenization ideas can happen very quickly. Equally importantly, the repo is in entirely in python to make it easier for the greatest number of people to try out new ideas.
 
-1. [minbpe/base.py](minbpe/base.py): Implements the `Tokenizer` class, which is the base class. It contains the `train`, `encode`, and `decode` stubs, save/load functionality, and there are also a few common utility functions. This class is not meant to be used directly, but rather to be inherited from.
-2. [minbpe/basic.py](minbpe/basic.py): Implements the `BasicTokenizer`, the simplest implementation of the BPE algorithm that runs directly on text.
-3. [minbpe/regex.py](minbpe/regex.py): Implements the `RegexTokenizer` that further splits the input text by a regex pattern, which is a preprocessing stage that splits up the input text by categories (think: letters, numbers, punctuation) before tokenization. This ensures that no merges will happen across category boundaries. This was introduced in the GPT-2 paper and continues to be in use as of GPT-4. This class also handles special tokens, if any.
-4. [minbpe/batch.py](minbpe/regex.py): Implements the `BatchTokenizer`, an optimization of the `RegexTokenizer`. Be sure to thoroughly review and understand the basic and regex tokenizers before using this one where the code is optimized for speed rather than readability. The regex splitting is the same, but the most significant difference is that this tokenizer does batch merging of several pairs at the same time. This is done safely and in almost all cases produces an equivalent tokenization as the `RegexTokenizer`. In the extremely rare case that these would not be totally equivalent, the difference would be unnoticeable.
-5. [minbpe/gpt4.py](minbpe/gpt4.py): Implements the `GPT4Tokenizer`. This class is a light wrapper around the `RegexTokenizer` (3, above) that exactly reproduces the tokenization of GPT-4 in the [tiktoken](https://github.com/openai/tiktoken) library. The wrapping handles some details around recovering the exact merges in the tokenizer, and the handling of some unfortunate (and likely historical?) 1-byte token permutations.
+There are two Tokenizers in this repository, both of which can perform the 3 primary functions of a Tokenizer: 1) train the tokenizer vocabulary and merges on a given text, 2) encode from text to tokens, 3) decode from tokens to text. The files of the repo are as follows:
 
-Finally, the script [train.py](train.py) trains the three major tokenizers on the input text [tests/taylorswift.txt](tests/taylorswift.txt) (this is the Wikipedia entry for her kek) and saves the vocab to disk for visualization. This script runs in about 25 seconds on my (M1) MacBook.
+0. [batchbpe/base.py](batchbpe/base.py): Implements the `Tokenizer` class, which is the base class. It has encode/decode and save/load functionality, and also a few common utility functions. This class is not meant to be used directly, but rather to be inherited from.
+1. [batchbpe/batch.py](batchbpe/batch.py): Implements the `BatchTokenizer` which includes a `train` method and `get_stats` and `merge_batch` functions needed to be able to train a new token vocabulary given input text. It inherits all the essentials from the `Tokenizer`.
+2. [batchbpe/quick.py](batchbpe/quick.py): Implements the `QuickTokenizer` which is a small speed optimization of the `BatchTokenizer`. It runs ~8% faster by disregarding the issue of overcounting potential merges in sequences of repeated characters (e.g. "aaaaa" counts as only 2 possible "a"-"a" merges in the `BatchTokenizer`, but 4 in the `QuickTokenizer`), and by combining the `get_stats` and `merge_batch` functions into a single function. More importantly, the `QuickTokenizer` serves as a demonstration of how to implement your own new tokenizer that inherits from `Tokenizer` to test out a new tokenization approach or idea.
+
+Finally, the script [train.py](train.py) trains the three major tokenizers on the input text [tests/taylorswift.txt](tests/taylorswift.txt) (this is the Wikipedia entry for her) and saves the vocab to disk for visualization. This script runs in about 25 seconds on my (M1) MacBook.
 
 All of the files above are very short and thoroughly commented, and also contain a usage example on the bottom of the file.
 
 ## quick start
 
-As the simplest example, we can reproduce the [Wikipedia article on BPE](https://en.wikipedia.org/wiki/Byte_pair_encoding) as follows:
+As the simplest demonstration, we can reproduce the [Wikipedia example on BPE](https://en.wikipedia.org/wiki/Byte_pair_encoding) as follows:
 
 ```python
-from minbpe import BasicTokenizer
-tokenizer = BasicTokenizer()
+from batchbpe import BatchTokenizer
+tokenizer = BatchTokenizer()
 text = "aaabdaaabac"
 tokenizer.train(text, 256 + 3) # 256 are the byte tokens, then do 3 merges
 print(tokenizer.encode(text))
@@ -33,7 +33,9 @@ tokenizer.save("toy")
 # writes two files: toy.model (for loading) and toy.vocab (for viewing)
 ```
 
-According to Wikipedia, running bpe on the input string: "aaabdaaabac" for 3 merges results in the string: "XdXac" where  X=ZY, Y=ab, and Z=aa. The tricky thing to note is that minbpe always allocates the 256 individual bytes as tokens, and then merges bytes as needed from there. So for us a=97, b=98, c=99, d=100 (their [ASCII](https://www.asciitable.com) values). Then when (a,a) is merged to Z, Z will become 256. Likewise Y will become 257 and X 258. So we start with the 256 bytes, and do 3 merges to get to the result above, with the expected output of [258, 100, 258, 97, 99].
+According to Wikipedia, running bpe on the input string: "aaabdaaabac" for 3 merges results in the string: "XdXac" where  X=ZY, Y=ab, and Z=aa. The tricky thing to note is that BatchBPE always allocates the 256 individual bytes as tokens, and then merges bytes as needed from there. So for us a=97, b=98, c=99, d=100 (their [ASCII](https://www.asciitable.com) values). Then when (a,a) is merged to Z, Z will become 256. Likewise Y will become 257 and X 258. So we start with the 256 bytes, and do 3 merges to get to the result above, with the expected output of [258, 100, 258, 97, 99].
+
+This example also demonstrates that the `BatchTokenizer` safely merges token pairs in batches. So in this highly artificial example, it makes the merges in the right order despite the fact that token 257 includes 256, and token 258 includes 257.
 
 ## inference: GPT-4 comparison
 
