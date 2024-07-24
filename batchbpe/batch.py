@@ -60,14 +60,13 @@ def merge_batch(ids, pairs):
             i = j
 
 class BatchTokenizer(Tokenizer):
-    def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0):
+    def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=0):
         """
         - pattern: optional string to override the default (GPT-4 split pattern)
         - special_tokens: str -> int dictionary of special tokens
           example: {'<|endoftext|>': 100257}
         """
-        super().__init__(pattern, multiprocess, store_dict)
-        self.stop_list_size = stop_list_size
+        super().__init__(pattern, multiprocess, store_dict, stop_list_size, freq_cutoff)
 
     def train(self, data, vocab_size, cap_divisor=2, max_batch_size=0, verbose=False):
         t0 = time.time()
@@ -78,7 +77,7 @@ class BatchTokenizer(Tokenizer):
         merges = self.merges   # {(int, int): int} -> token pair to new token
         vocab = self.vocab   # {int: bytes} -> token to its bytes representation
         batch_count = 0
-        curr_vocab_size = len(vocab)
+        curr_vocab_size = len(vocab) + len(self.special_tokens)
         num_merges = vocab_size - curr_vocab_size
         merges_remaining = num_merges
         if max_batch_size < 1:
@@ -103,9 +102,10 @@ class BatchTokenizer(Tokenizer):
                 curr_vocab_size += 1
             merges_remaining -= len(pairs_to_merge)
             # replace all occurrences in ids of pairs_to_merge keys with their values
-            merge_batch(ids, pairs_to_merge)
             merges.update(pairs_to_merge)  # save the merges
             batch_count += 1
+            if merges_remaining:   # no need to merge last batch
+                merge_batch(ids, pairs_to_merge)
             if verbose:
                 t2 = time.time()
                 print(f"Batch {batch_count} merged {len(pairs_to_merge)} pairs in {t2-t1:.2f} sec. Merges remaining: {merges_remaining}") # unique words: {len(ids)} processed words: {sum(ids.values())}")

@@ -79,7 +79,7 @@ def _process_string_scalar(batch, compiled_pattern):
 
 class Tokenizer:
     """Base class for Tokenizers"""
-    def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0):
+    def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=0):
         # default: vocab size of 256 (all bytes), no merges, no patterns
         self.merges = {} # (int, int) -> int
         self.pattern = "" # str
@@ -94,6 +94,8 @@ class Tokenizer:
             self.cpus = 1
         self.store_dict = store_dict
         self.stop_list_size = stop_list_size
+        self.stop_words = {}
+        self.freq_cutoff = freq_cutoff
 
     def _id_dict_to_list(self, ids):
         if self.stop_list_size > 0:
@@ -102,23 +104,31 @@ class Tokenizer:
             # filter out single character chunks
             index = len(self.vocab)
             stop_index = index + self.stop_list_size
+            stop_words = {}
             for key, val in top2X:
-                self.merges[key] = index
-                self.vocab[index] = [*key.encode('utf-8')]
-                index += 1
+                if len(key) > 1:
+                    stop_words[key] = index
+                    self.vocab[index] = key.encode('utf-8')
+                    index += 1
                 if index == stop_index:
                     break
+            self.stop_words = stop_words
+            if self.freq_cutoff:
+                return [([*key.encode('utf-8')], val) for key, val in ids.items()
+                        if (key not in self.stop_words and val >= self.freq_cutoff)]
+            return [([*key.encode('utf-8')], val) for key, val in ids.items()
+                    if key not in self.stop_words]
 
-            return [([*key.encode('utf-8')], val) for key, val in ids.items() if key not in topX]
+        if self.freq_cutoff:
+            return [([*key.encode('utf-8')], val) for key, val in ids.items()
+                    if val >= self.freq_cutoff]
         return [([*key.encode('utf-8')], val) for key, val in ids.items()]
 
     def _import_data(self, data):
         # determine if `data` is a text as a string, a path to a file, a url to
         # a text document, a dictionary of datasets kwargs, or a list of any of
         # the above. Return a list of 2-tuples of bytes objects and their counts.
-        print(f"Importing data of type {type(data)}")
         ids = Counter()
-        default_kwargs = {'path': 'parquet', 'split': 'train'}
         if not isinstance(data, (list, tuple)):
             data = (data,)
         for item in data:
@@ -176,13 +186,13 @@ class Tokenizer:
                         ids.update(re.findall(self.compiled_pattern, _dict['train']))
             elif isinstance(item, IterableDataset):
                 print('Serially processing IterableDataset...')
-                info = []
+                # info = []
                 for _dict in item:
                     ids.update(re.findall(self.compiled_pattern, _dict['text']))
-                    info.append([len(ids), sum(ids.values())])
+                    # info.append([len(ids), sum(ids.values())])
 
-                self.df = pd.DataFrame(info, columns=['Unique Text Chunks', 'Total Text Chunks'])
-                pdb.set_trace()
+                # self.df = pd.DataFrame(info, columns=['Unique Text Chunks', 'Total Text Chunks'])
+                # pdb.set_trace()
 
         if self.store_dict:
             ids[self.pattern] = 0   # store the pattern used to split the text as the last key
@@ -215,7 +225,8 @@ class Tokenizer:
     def register_special_tokens(self, special_tokens):
         # special_tokens is a dictionary of str -> int
         # example: {"<|endoftext|>": 100257}
-        self.special_tokens = special_tokens
+        
+        self.special_tokens.update(special_tokens)
         self.inverse_special_tokens = {v: k for k, v in special_tokens.items()}
 
     def save(self, file_prefix):
@@ -229,15 +240,18 @@ class Tokenizer:
         model_file = file_prefix + ".model"
         with open(model_file, 'w') as f:
             # write the version, pattern and merges, that's all that's needed
-            f.write("minbpe v1\n")
+            f.write("BatchBPE v1\n")
             f.write(f"{self.pattern}\n")
             # write the special tokens, first the number of them, then each one
             f.write(f"{len(self.special_tokens)}\n")
             for special, idx in self.special_tokens.items():
                 f.write(f"{special} {idx}\n")
             # the merges dict
-            for idx1, idx2 in self.merges:
-                f.write(f"{idx1} {idx2}\n")
+            for key in self.merges:
+                if isinstance(key, tuple):
+                    f.write(f"{key[0]} {key[1]}\n")
+                else:
+                    f.write(f"{key}\n")
         # write the vocab: for the human to look at
         vocab_file = file_prefix + ".vocab"
         inverted_merges = {idx: pair for pair, idx in self.merges.items()}
@@ -299,8 +313,8 @@ class Tokenizer:
 
     @lru_cache(maxsize=131072)
     def _encode_chunk(self, chunk):
-        if chunk in self.merges:
-            return [self.merges[chunk]]
+        if chunk in self.stop_words:   # TODO: revisit this if
+            return [self.stop_words[chunk]]
         # return the token chunk as a list of ints, similar to a bytes object
         chunk = [*chunk.encode("utf-8")]
         len_chunk = len(chunk)
