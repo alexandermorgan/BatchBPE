@@ -1,10 +1,25 @@
-# BatchBPE
+<h1 style="text-align: center;">BatchBPE</h1>
 
-Practical performant pure python implementation of the (byte-level) Byte Pair Encoding (BPE) algorithm commonly used in LLM tokenization. The BPE algorithm is "byte-level" because it runs on UTF-8 encoded strings. "Batch" is for the most characteristic aspect of BatchBPE, which is that it executes token-pair merges safely in batches. ~200 is the average batch size when building a ~50k token vocabulary.
+Practical, performant, pure python implementation of a Byte Pair Encoding (BPE) tokenizer. The "Batch" part of the name is for the most characteristic aspect of BatchBPE, which is that it executes token-pair merges safely in batches. ~200 is the average batch size when building a ~50k token vocabulary based on English training texts.
 
-This repo is a fork of Andrej Karpathy's excellent introduction to the BPE used for LLM tokenization. If you're new to the subject but haven't reviewed Karpathy's resources, definitely start there. He has a [2-hour video](), accompanying [minbpe github repo], and a [colab notebook](). I highly recommend all three. Tokenization is deceptively simple, so a deep dive into the topic is definitely worth it even if you can understand the basics of it with a 60-second description.
+Here is the shortest useful demonstration of what BatchBPE can do (after installing): load 1GB's worth of text into a tokenizer and train a ~50k token vocabulary. Don't worry, it doesn't download any data:
 
-This BatchBPE began as a PR for minbpe but developed to the point where the objective changed. Instead of minbpe's pedagogic purpose, BatchBPE aims to be as practical and easy to modify as possible. The goal is to make it easy for people to try out new tokenization ideas even if they're working with limited compute, memory, or hard-disk resources. A lot of making tokenization more accessible boils down to compute and memory optimizations. Using BatchBPE's fastest combination of settings (described below), you can train a GPT2-sized vocabulary (~50k tokens) on 1GB's worth of text in well under a minute on a 4-year old laptop. So yes, trying out new tokenization ideas can happen very quickly. Equally importantly, the repo is in entirely in python to make it easier for the greatest number of people to try out new ideas.
+```python
+from batchbpe import QuickTokenizer
+tokenizer = QuickTokenizer()
+data = 'path_to_sample_dict_of_1gb_of_text_with_freq_cutoff_10.json'
+tokenizer.train(data, 50304, verbose=True)
+```
+
+The example above runs in less than a minute on an old laptop, not bad for a pure python implementation! The purpose of this repo is to be easy to use and tinker with. I hope it helps people think up and quickly try out new tokenization approaches.
+
+## Origin Story
+
+This repo is a fork of Andrej Karpathy's excellent introduction to the BPE used for LLM tokenization. If you're new to the subject but haven't reviewed Karpathy's resources, definitely start there. He has a [2-hour video lecture](https://www.youtube.com/watch?v=zduSFxRajkE) (and [text version of lecture](https://github.com/karpathy/minbpe/blob/master/lecture.md)), accompanying [minbpe github repo](https://github.com/karpathy/minbpe), and [colab notebook](https://www.youtube.com/redirect?event=video_description&redir_token=QUFFLUhqbEtrVFZtbHhpLUtxWE5aeVNIaUlSNkhpWHdVUXxBQ3Jtc0tuWE9pbHBPZmF2anlYeTZfdTlVXzYyTmREeDNEejZMYnctNk96UnFuMjZBTUVHemkyWjdlWEhYSE56LUNsVFJrakNXeng3NEQxREkwLUFlQWpKa1JHd3JfX3k5dU5TVWFoQzNnWU9XY0lPUElUTUtydw&q=https%3A%2F%2Fcolab.research.google.com%2Fdrive%2F1y0KnCFZvGVf_odSfcNAws6kcDD7HsI0L%3Fusp%3Dsharing&v=zduSFxRajkE). I highly recommend all three. Tokenization is deceptively simple, so a deep dive into the topic is definitely worth it even if you can understand the basics with a 60-second intro.
+
+This BatchBPE repo began as a PR for Karpath's minbpe but developed to the point where the objective changed. Instead of minbpe's pedagogic purpose, BatchBPE aims to be as practical and easy to modify as possible. The goal is to make it easy for people to try out new tokenization ideas even if they're working with limited compute, memory, or hard-disk resources. A lot of making tokenization more accessible boils down to compute and memory optimizations. Using BatchBPE's fastest combination of settings (described below), you can train a GPT2-sized vocabulary (~50k tokens) on 1GB's worth of text in well under a minute on a 4-year old laptop. So yes, trying out new tokenization ideas can happen very quickly. Equally importantly, the repo is in entirely in python to make it easier for the greatest number of people to try out new ideas.
+
+## Two Available Tokenizers
 
 There are two Tokenizers in this repository, both of which can perform the 3 primary functions of a Tokenizer: 1) train the tokenizer vocabulary and merges on a given text, 2) encode from text to tokens, 3) decode from tokens to text. The files of the repo are as follows:
 
@@ -14,11 +29,15 @@ There are two Tokenizers in this repository, both of which can perform the 3 pri
 
 Finally, the script [train.py](train.py) trains the three major tokenizers on the input text [tests/taylorswift.txt](tests/taylorswift.txt) (this is the Wikipedia entry for her) and saves the vocab to disk for visualization. This script runs in about 25 seconds on my (M1) MacBook.
 
-All of the files above are very short and thoroughly commented, and also contain a usage example on the bottom of the file.
+## Installation
 
-## quick start
+1. Clone this repo: `git clone https://github.com/alexandermorgan/BatchBPE.git`
+2. cd into batchbpe directory, set up a virtual environment and activate it
+3. `uv pip install requirements.txt`
 
-As the simplest demonstration, we can reproduce the [Wikipedia example on BPE](https://en.wikipedia.org/wiki/Byte_pair_encoding) as follows:
+## Quick Start
+
+For an example that's easy to inspect, we can reproduce the [Wikipedia example on BPE](https://en.wikipedia.org/wiki/Byte_pair_encoding) as follows:
 
 ```python
 from batchbpe import BatchTokenizer
@@ -35,103 +54,115 @@ tokenizer.save("toy")
 
 According to Wikipedia, running bpe on the input string: "aaabdaaabac" for 3 merges results in the string: "XdXac" where  X=ZY, Y=ab, and Z=aa. The tricky thing to note is that BatchBPE always allocates the 256 individual bytes as tokens, and then merges bytes as needed from there. So for us a=97, b=98, c=99, d=100 (their [ASCII](https://www.asciitable.com) values). Then when (a,a) is merged to Z, Z will become 256. Likewise Y will become 257 and X 258. So we start with the 256 bytes, and do 3 merges to get to the result above, with the expected output of [258, 100, 258, 97, 99].
 
-This example also demonstrates that the `BatchTokenizer` safely merges token pairs in batches. So in this highly artificial example, it makes the merges in the right order despite the fact that token 257 includes 256, and token 258 includes 257.
+This example also demonstrates that the batch merging approach to tokenization safely merges token pairs in batches. So in this highly artificial example, it makes the merges in the right order despite the fact that token 257 includes 256, and token 258 includes 257.
 
-## inference: GPT-4 comparison
+## Other Import Types
 
-We can verify that the `RegexTokenizer` has feature parity with the GPT-4 tokenizer from [tiktoken](https://github.com/openai/tiktoken) as follows:
+Data loading is the same for the Batch and Quick tokenizers. You can load text data via:
 
-```python
-text = "hello123!!!? (안녕하세요!) 😉"
+- literal string (as in the Wikipedia example above)
+- path or url to .txt file
+- datasets library Dataset object
+- datasets library IterableDataset object (not recommended)
+- dictionary or path to a json file of a dictionary saved by a previous Tokenizer data import
+- list/tuple of any combination of the above
 
-# tiktoken
-import tiktoken
-enc = tiktoken.get_encoding("cl100k_base")
-print(enc.encode(text))
-# [15339, 4513, 12340, 30, 320, 31495, 230, 75265, 243, 92245, 16715, 57037]
-
-# ours
-from minbpe import GPT4Tokenizer
-tokenizer = GPT4Tokenizer()
-print(tokenizer.encode(text))
-# [15339, 4513, 12340, 30, 320, 31495, 230, 75265, 243, 92245, 16715, 57037]
-```
-
-(you'll have to `pip install tiktoken` to run). Under the hood, the `GPT4Tokenizer` is just a light wrapper around `RegexTokenizer`, passing in the merges and the special tokens of GPT-4. We can also ensure the special tokens are handled correctly:
+HuggingFace's datasets library is great way to get large specialized text datasets, though it can be a little tricky to use. When passing a regular Dataset object, BatchBPE will try to multiprocess the data loading using joblib. This default can be disabled by passing `multiprocess=False` when instantiating your tokenizer. Here's an example of passing a `datasets.Dataset` from a local parquet file.
 
 ```python
-text = "<|endoftext|>hello world"
-
-# tiktoken
-import tiktoken
-enc = tiktoken.get_encoding("cl100k_base")
-print(enc.encode(text, allowed_special="all"))
-# [100257, 15339, 1917]
-
-# ours
-from minbpe import GPT4Tokenizer
-tokenizer = GPT4Tokenizer()
-print(tokenizer.encode(text, allowed_special="all"))
-# [100257, 15339, 1917]
-```
-
-Note that just like tiktoken, we have to explicitly declare our intent to use and parse special tokens in the call to encode. Otherwise this can become a major footgun, unintentionally tokenizing attacker-controlled data (e.g. user prompts) with special tokens. The `allowed_special` parameter can be set to "all", "none", or a list of special tokens to allow.
-
-## training
-
-Unlike tiktoken, this code allows you to train your own tokenizer. In principle and to my knowledge, if you train the `RegexTokenizer` on a large dataset with a vocabulary size of 100K, you would reproduce the GPT-4 tokenizer.
-
-There are three paths you can follow. First, you can decide that you don't want the complexity of splitting and preprocessing text with regex patterns, and you also don't care for special tokens. In that case, reach for the `BasicTokenizer`. You can train it, and then encode and decode for example as follows:
-
-```python
-from minbpe import BasicTokenizer
-tokenizer = BasicTokenizer()
-tokenizer.train(very_long_training_string, vocab_size=4096)
-tokenizer.encode("hello world") # string -> tokens
-tokenizer.decode([1000, 2000, 3000]) # tokens -> string
-tokenizer.save("mymodel") # writes mymodel.model and mymodel.vocab
-tokenizer.load("mymodel.model") # loads the model back, the vocab is just for vis
-```
-
-If you instead want to follow along with OpenAI did for their text tokenizer, it's a good idea to adopt their approach of using regex pattern to split the text by categories. The GPT-4 pattern is a default with the `RegexTokenizer`, so you'd simple do something like:
-
-```python
-from minbpe import RegexTokenizer
-tokenizer = RegexTokenizer()
-tokenizer.train(very_long_training_string, vocab_size=32768)
-tokenizer.encode("hello world") # string -> tokens
-tokenizer.decode([1000, 2000, 3000]) # tokens -> string
-tokenizer.save("tok32k") # writes tok32k.model and tok32k.vocab
-tokenizer.load("tok32k.model") # loads the model back from disk
-```
-
-Where, of course, you'd want to change around the vocabulary size depending on the size of your dataset.
-
-Once you're comfortable with the Basic and Regex tokenizers, you may want to use the `BatchTokenizer` which is an optimization of the `RegexTokenizer`. The regex handling is the same as for the `RegexTokenizer`:
-
-```python
-from minbpe import BatchTokenizer
+from batchbpe import BatchTokenizer
 tokenizer = BatchTokenizer()
-tokenizer.train(very_long_training_string, vocab_size=32768)
-tokenizer.encode("hello world") # string -> tokens
-tokenizer.decode([1000, 2000, 3000]) # tokens -> string
-tokenizer.save("tok32k") # writes tok32k.model and tok32k.vocab
-tokenizer.load("tok32k.model") # loads the model back from disk
+path = 'path_to_parquet_file'
+kwargs = {'path': 'parquet', 'data_files': {'train': path}, 'split': 'train'}
+data = load_dataset(**kwargs)
+tokenizer.train(data, 50304, verbose=True)
 ```
 
-**Special tokens**. Finally, you might wish to add special tokens to your tokenizer. Register these using the `register_special_tokens` function. For example if you train with vocab_size of 32768, then the first 256 tokens are raw byte tokens, the next 32768-256 are merge tokens, and after those you can add the special tokens. The last "real" merge token will have id of 32767 (vocab_size - 1), so your first special token should come right after that, with an id of exactly 32768. So:
+Alternatively this could be a `pyarrow.ChunkedArray` object like this:
 
 ```python
-from minbpe import RegexTokenizer
-tokenizer = RegexTokenizer()
-tokenizer.train(very_long_training_string, vocab_size=32768)
-tokenizer.register_special_tokens({"<|endoftext|>": 32768})
-tokenizer.encode("<|endoftext|>hello world", allowed_special="all")
+from batchbpe import BatchTokenizer
+tokenizer = BatchTokenizer()
+path = 'full_path_to_parquet_file'
+kwargs = {'path': 'parquet', 'data_files': {'train': path}, 'split': 'train'}
+data = load_dataset(**kwargs).data['text']
+tokenizer.train(data, 50304, verbose=True)
 ```
 
-You can of course add more tokens after that as well, as you like. Finally, I'd like to stress that I tried hard to keep the code itself clean, readable and hackable. You should not have feel scared to read the code and understand how it works. The tests are also a nice place to look for more usage examples. That reminds me:
+It is also possible to pass a `datasets.IterableDataset` though this is currently not recommended because it is very slow for large datasets. I think I must be processing it poorly so I hope to improve this. Here is the example:
 
-## tests
+```python
+from batchbpe import BatchTokenizer
+tokenizer = BatchTokenizer()
+path = 'full_path_to_parquet_file'
+kwargs = {'path': 'melikocki/preprocessed_shakespeare', 'split': 'train', 'streaming': True}
+data = load_dataset(**kwargs)
+tokenizer.train(data, 50304, verbose=True)
+```
+
+Instead of streaming datasets, if you want to load datasets that don't fit in memory and/or hard-disk space, I recommend downloading as many of the files of the dataset at a time as possible, then converting those to BatchBPE's json representation of a dataset which is a greater than 100X compression for large datasets, and then deleting the dataset files. Do this for as many groups of files as necessary, then load a list of the json files BatchBPE produced to combine those. For example, the 10B token sample of the FineWeb-Edu dataset is about 27GB spread out among 10 files. Say you only have room for 5 of those files at a time on your computer, you could load the entire dataset in the following way. While this requires a bit more setup, subsequent uses of the json file will be very fast, so you only have to do it once.
+
+```python
+# download 5 files from the dataset before beginning
+from batchbpe import BatchTokenizer
+tokenizer = BatchTokenizer(store_dict=True)   # note `store_dict` param
+paths = ['path_to_parquet_file_1', ... 'path_to_parquet_file_5']
+kwargs = [{'path': 'parquet', 'data_files': {'train': path}, 'split': 'train'} for path in paths]
+data = [load_dataset(**kwg) for kwg in kwargs]
+tokenizer.train(data, 256)   # calling train with vocab_size of 256 will do no merges, but does call _import_data
+# the json file will be saved in the format '{date}-{time}-dataset-dict.json'
+
+# Then delete the five files, download the remaining dataset files and repeat the above with those files.
+
+# Then import the two json file dataset distillations you have. You can also further compress this into one json file for future use.
+tokenizer3 = BatchTokenizer(store_dict=True)
+paths = ['path_to_first_json_file.json', 'path_to_second_json_file.json']
+tokenizer3.train(paths, 50304)   # now you can train a vocabulary on your full dataset
+# for later use, the data from all ten files combined will be in the new json file in the same '{date}-{time}-dataset-dict.json' format.
+```
+
+## Registering Special Tokens
+
+The ability to register special tokens remains in tact from Karpathy's minbpe repo. Note that just like tiktoken, we have to explicitly declare our intent to use and parse special tokens in the call to encode. Otherwise this can become a major footgun, unintentionally tokenizing attacker-controlled data (e.g. user prompts) with special tokens. The `allowed_special` parameter can be set to "all", "none", or a list of special tokens to allow.
+
+```python
+from batchbpe import BatchTokenizer
+text = "<|endoftext|>hello world"
+specials = {'<|endoftext|>': 50304}
+tokenizer = BatchTokenizer()
+tokenizer.load('path_to_experiment_model_file')   # load existing vocab to save time
+tokenizer.register_special_tokens(specials)
+
+# still encodes without using the special tokens by default
+print(tokenizer.encode(text))
+# [100257, 15339, 1917]
+
+# explicitly set allowed_special='all' to use special tokens
+print(tokenizer.encode(text, allowed_special='all'))
+# [100257, 15339, 1917]
+```
+
+## Special Features
+
+### Batching Token Pair Merges
+
+If the idea of batching token merges still makes you nervous, you can set `max_batch_size=1` to merge one pair at a time:
+
+```python
+tokenizer = BatchTokenizer()
+path = 'path_to_first_json_file.json'
+tokenizer.train(path, 50304, max_batch_size=1)
+```
+
+### Stop Word Handling
+
+### Frequency Cutoff
+
+### Compress Text into Dictionary Representation
+
+## Difference Between BatchTokenizer and QuickTokenizer
+
+## Tests
 
 We use the pytest library for tests. All of them are located in the `tests/` directory. First `pip install pytest` if you haven't already, then:
 
@@ -140,25 +171,6 @@ $ pytest -v .
 ```
 
 to run the tests. (-v is verbose, slightly prettier).
-
-## community extensions
-
-* [gnp/minbpe-rs](https://github.com/gnp/minbpe-rs): A Rust implementation of `minbpe` providing (near) one-to-one correspondence with the Python version
-
-## exercise
-
-For those trying to study BPE, here is the advised progression exercise for how you can build your own minbpe step by step. See [exercise.md](exercise.md).
-
-## lecture
-
-I built the code in this repository in this [YouTube video](https://www.youtube.com/watch?v=zduSFxRajkE). You can also find this lecture in text form in [lecture.md](lecture.md).
-
-## todos
-
-- write a more optimized Python version that could run over large files and big vocabs
-- write an even more optimized C or Rust version (think through)
-- rename GPT4Tokenizer to GPTTokenizer and support GPT-2/GPT-3/GPT-3.5 as well?
-- write a LlamaTokenizer similar to GPT4Tokenizer (i.e. attempt sentencepiece equivalent)
 
 ## License
 
