@@ -1,12 +1,12 @@
 """
 Contains the base Tokenizer class and a few common helper functions, namely the
-tokenizer save/load functionality, and the data import/save functionality.
+tokenizer save/load functionality, the data import/save functionality, and the
+encode/decode methods. To train a tokenizer, use the BatchTokenizer or
+QuickTokenizer subclasses of this Tokenizer class.
 """
 import unicodedata
-import pandas as pd
 from collections import Counter
 from functools import lru_cache
-import matplotlib.pyplot as plt
 import requests
 from datasets import load_dataset, IterableDataset, Dataset
 from pyarrow import ChunkedArray
@@ -14,7 +14,6 @@ from joblib import Parallel, delayed, cpu_count
 import time
 import os
 import json
-import pdb
 import regex as re
 
 
@@ -62,10 +61,10 @@ def render_token(t: bytes) -> str:
     s = replace_control_characters(s)
     return s
 
-def _process_dicts(batch, compiled_pattern):
+def _process_dicts(batch, compiled_pattern):   # for raw datasets.Dataset
     counter = Counter()
     for item in batch:
-        counter.update(re.findall(compiled_pattern, item['text']))
+        counter.update(re.findall(compiled_pattern, item))
     return counter
 
 def _process_string_scalar(batch, compiled_pattern):
@@ -79,7 +78,7 @@ def _process_string_scalar(batch, compiled_pattern):
 
 class Tokenizer:
     """Base class for Tokenizers"""
-    def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=0):
+    def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=1):
         # default: vocab size of 256 (all bytes), no merges, no patterns
         self.merges = {} # (int, int) -> int
         self.pattern = "" # str
@@ -89,40 +88,41 @@ class Tokenizer:
         self.compiled_pattern = re.compile(self.pattern)
         self.multiprocess = multiprocess
         if multiprocess:
-            self.cpus = cpu_count()
+            self._cpus = cpu_count()
         else:
-            self.cpus = 1
+            self._cpus = 1
         self.store_dict = store_dict
         self.stop_list_size = stop_list_size
         self.stop_words = {}
         self.freq_cutoff = freq_cutoff
 
     def _id_dict_to_list(self, ids):
-        if self.stop_list_size > 0:
+        if self.stop_list_size:
             # get twice as many to be sure to be able to get X chunks of length > 1
             top2X = ids.most_common(2*self.stop_list_size)
-            # filter out single character chunks
             index = len(self.vocab)
             stop_index = index + self.stop_list_size
             stop_words = {}
             for key, val in top2X:
-                if len(key) > 1:
+                if len(key) > 1: # and re.match(r'^ [A-Za-z\'’`]+$[A-Za-z]*', key):
                     stop_words[key] = index
                     self.vocab[index] = key.encode('utf-8')
                     index += 1
                 if index == stop_index:
                     break
             self.stop_words = stop_words
-            if self.freq_cutoff:
+            if self.freq_cutoff > 1:
                 return [([*key.encode('utf-8')], val) for key, val in ids.items()
-                        if (key not in self.stop_words and val >= self.freq_cutoff)]
-            return [([*key.encode('utf-8')], val) for key, val in ids.items()
-                    if key not in self.stop_words]
-
-        if self.freq_cutoff:
-            return [([*key.encode('utf-8')], val) for key, val in ids.items()
-                    if val >= self.freq_cutoff]
-        return [([*key.encode('utf-8')], val) for key, val in ids.items()]
+                        if (val >= self.freq_cutoff and key not in self.stop_words)]
+            else:
+                return [([*key.encode('utf-8')], val) for key, val in ids.items()
+                        if key not in self.stop_words]
+        else:   # self.stop_list_size == 0
+            if self.freq_cutoff > 1:
+                return [([*key.encode('utf-8')], val) for key, val in ids.items()
+                        if val >= self.freq_cutoff]
+            else:
+                return [([*key.encode('utf-8')], val) for key, val in ids.items()]
 
     def _import_data(self, data):
         # determine if `data` is a text as a string, a path to a file, a url to
@@ -132,69 +132,42 @@ class Tokenizer:
         if not isinstance(data, (list, tuple)):
             data = (data,)
         for item in data:
-            # process dict or json file from previous data load
-            if isinstance(item, dict) or (isinstance(item, str) and item.endswith('.json')):
+            # convert to ChunkedArray, dict, or str of text to parse
+            if isinstance(item, Dataset):
+                item = item.data['text']
+            elif isinstance(item, str) and item.endswith('.json'):   # json file from previous data load
                 with open(item, 'r') as f:
-                    _ids_dict = json.load(f)
-                if not _ids_dict:
-                    print(f'Dictionary loaded from {item} is empty.')
-                    continue
-                last_item = _ids_dict.popitem()
-                if last_item[1] != 0:
-                    print(f'Warning: the dictionary stored in {item} does not seem to have been saved by this \
-                    tokenizer. Attempting to use it anyway...')
-                    _ids_dict[last_item[0]] = last_item[1]
-                elif last_item[0] != self.pattern:
-                    print(f'Warning: the dictionary stored in {item} did not use the same split pattern. \
-                    The dictionary was made using:\n\t{last_item[0]}\n\n\
-                    The currnet split pattern is:\n\t{self.pattern}\n\n\
-                    Proceeding to use the dictionary anyway...')
-                ids.update(_ids_dict)
+                    item = json.load(f)
             elif isinstance(item, str):
                 if item.startswith('https://') or item.startswith('http://'):
-                    text = requests.get(item).text    # if it's a url, assume it's to a text file
-                    ids.update(re.findall(self.compiled_pattern, text))
+                    item = requests.get(item).text    # if it's a url, assume it's to a text file
                 elif os.path.isfile(item) and item.endswith('.txt'):
                     with open(item, 'r', encoding='utf-8') as f:
-                        ids.update(re.findall(self.compiled_pattern, f.read()))
-                else:   # assume the string is the text itself
-                    ids.update(re.findall(self.compiled_pattern, item))
+                        item = f.read()
+            # process data
+            if isinstance(item, dict):
+                last_item = item.popitem()
+                if last_item[1] != 0:
+                    print(f'Warning: the json file passed does not seem to have been made by this tokenizer.')
+                    item[last_item[0]] = last_item[1]
+                elif last_item[0] != self.pattern:
+                    print(f'Warning: the dictionary or json file passed did not use the same split pattern.')
+                ids.update(item)
+            elif isinstance(item, str):   # assume the string is the text itself
+                ids.update(re.findall(self.compiled_pattern, item))
             elif isinstance(item, ChunkedArray):
-                batch_size = len(item) // (self.cpus*2) or 1
-                print(f'Processing in {self.cpus} batches of size {batch_size}')
+                batch_size = len(item) // (self._cpus*2) or 1
                 batches = [item[i:i + batch_size] for i in range(0, len(item), batch_size)]
                 print(f'Processing {len(batches)} batches of size {batch_size}')
-                # Process each batch in parallel
-                results = Parallel(n_jobs=self.cpus)(delayed(_process_string_scalar)(batch, self.compiled_pattern) for batch in batches)
+                results = Parallel(n_jobs=self._cpus)(delayed(_process_string_scalar)(batch, self.compiled_pattern) for batch in batches)
                 for result in results:  # Aggregate results into one Counter
                     ids.update(result)
-            elif isinstance(item, Dataset):
-                # item = load_dataset(**item).data #.data['text']#[:400000] #[:345250] is one gigabyte
-                print(f'Datasets branch, type of item: {type(item)}')
-                print(f"Loading {item.size_in_bytes/1024/1024:.2f} MB dataset")
-                if self.multiprocess and len(item) > 1:
-                    batch_size = len(item) // (self.cpus*2) or 1
-                    batches = [item[i:i + batch_size] for i in range(0, len(item), batch_size)]
-                    print(f'Processing {len(batches)} batches of size {batch_size}')
-                    # Process each batch in parallel
-                    pdb.set_trace()
-                    results = Parallel(n_jobs=self.cpus)(delayed(_process_dicts)(batch, self.compiled_pattern) for batch in batches)
-                    for result in results:  # Aggregate results into one Counter
-                        ids.update(result)
-                else:
-                    for _dict in item:
-                        ids.update(re.findall(self.compiled_pattern, _dict['train']))
             elif isinstance(item, IterableDataset):
                 print('Serially processing IterableDataset...')
-                # info = []
                 for _dict in item:
                     ids.update(re.findall(self.compiled_pattern, _dict['text']))
-                    # info.append([len(ids), sum(ids.values())])
 
-                # self.df = pd.DataFrame(info, columns=['Unique Text Chunks', 'Total Text Chunks'])
-                # pdb.set_trace()
-
-        if self.store_dict:
+        if self.store_dict:   # store dict compression of dataset to a json file if requested
             ids[self.pattern] = 0   # store the pattern used to split the text as the last key
             formatted_time = time.strftime('%Y-%m-%d-%H:%M', time.localtime())
             filename = f'{formatted_time}-dataset-dict.json'
@@ -225,8 +198,7 @@ class Tokenizer:
     def register_special_tokens(self, special_tokens):
         # special_tokens is a dictionary of str -> int
         # example: {"<|endoftext|>": 100257}
-        
-        self.special_tokens.update(special_tokens)
+        self.special_tokens = special_tokens
         self.inverse_special_tokens = {v: k for k, v in special_tokens.items()}
 
     def save(self, file_prefix):
@@ -313,7 +285,7 @@ class Tokenizer:
 
     @lru_cache(maxsize=131072)
     def _encode_chunk(self, chunk):
-        if chunk in self.stop_words:   # TODO: revisit this if
+        if chunk in self.stop_words:   # TODO: revisit this if statement
             return [self.stop_words[chunk]]
         # return the token chunk as a list of ints, similar to a bytes object
         chunk = [*chunk.encode("utf-8")]

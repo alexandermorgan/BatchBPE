@@ -2,16 +2,11 @@
 Lightweight Byte Pair Encoding tokenizer. Merges are safely made in batches
 along with other optimizations to be a practical tool for trying out new
 tokenization strategies.
-
-Algorithmically follows along the GPT tokenizer:
-https://github.com/openai/gpt-2/blob/master/src/encoder.py
-
 """
 from .base import Tokenizer
 from collections import defaultdict
 from heapq import nlargest
 import time
-import pdb
 
 
 def get_stats(ids):
@@ -23,11 +18,10 @@ def get_stats(ids):
     element of one key the first element of the next key. The integer value
     associated with each key serves as a multiplier for the count of each pair
     within that object. Consecutive identical pairs within the same bytes object
-    are counted only once to avoid overcounting repeat characters. This will
-    multiprocess using the number of cpus specified.
+    are counted only once to avoid overcounting repeat characters.
 
     Example:
-        get_stats({b'abc': 2, b'bcd': 1, b'eee': 1})
+        get_stats([([97, 98, 99], 2), ([98, 99, 100], 1), ([101, 101, 101], 1)])
         -> defaultdict(<class 'int'>, {(97, 98): 1, (98, 99): 2, (99, 100): 1, (101, 101): 1})
     """
     counts = defaultdict(int)
@@ -70,7 +64,7 @@ class BatchTokenizer(Tokenizer):
 
     def train(self, data, vocab_size, cap_divisor=2, max_batch_size=0, verbose=False):
         t0 = time.time()
-        ids = self._import_data(data)   # [(bytes, int)] -> text chunks and their counts
+        ids = self._import_data(data)   # [(list_of_int_tokens, int)] -> text chunks and their counts
         t1 = time.time()
         print(f'Time spent loading data: {t1-t0:.2f}')
 
@@ -101,15 +95,13 @@ class BatchTokenizer(Tokenizer):
                 vocab[curr_vocab_size] = vocab[first] + vocab[last]
                 curr_vocab_size += 1
             merges_remaining -= len(pairs_to_merge)
-            # replace all occurrences in ids of pairs_to_merge keys with their values
             merges.update(pairs_to_merge)  # save the merges
             batch_count += 1
             if merges_remaining:   # no need to merge last batch
-                merge_batch(ids, pairs_to_merge)
+                merge_batch(ids, pairs_to_merge)   # replace pairs_to_merge keys in ids with their values
             if verbose:
                 t2 = time.time()
-                print(f"Batch {batch_count} merged {len(pairs_to_merge)} pairs in {t2-t1:.2f} sec. Merges remaining: {merges_remaining}") # unique words: {len(ids)} processed words: {sum(ids.values())}")
+                print(f"Batch {batch_count} merged {len(pairs_to_merge)} pairs in {t2-t1:.2f} sec. Merges remaining: {merges_remaining}")
                 t1 = t2
-        # save class variables
         self.merges = merges # used in encode()
         self.vocab = vocab   # used in decode()

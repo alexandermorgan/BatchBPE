@@ -1,4 +1,4 @@
-<h1 style="text-align: center;">BatchBPE</h1>
+# BatchBPE
 
 Practical, performant, pure python implementation of a Byte Pair Encoding (BPE) tokenizer. The "Batch" part of the name is for the most characteristic aspect of BatchBPE, which is that it executes token-pair merges safely in batches. ~200 is the average batch size when building a ~50k token vocabulary based on English training texts.
 
@@ -56,7 +56,7 @@ According to Wikipedia, running bpe on the input string: "aaabdaaabac" for 3 mer
 
 This example also demonstrates that the batch merging approach to tokenization safely merges token pairs in batches. So in this highly artificial example, it makes the merges in the right order despite the fact that token 257 includes 256, and token 258 includes 257.
 
-## Other Import Types
+## Accepted Import Types
 
 Data loading is the same for the Batch and Quick tokenizers. You can load text data via:
 
@@ -154,17 +154,39 @@ path = 'path_to_first_json_file.json'
 tokenizer.train(path, 50304, max_batch_size=1)
 ```
 
+### Compress Text into Dictionary Representation
+
 ### Stop Word Handling
+
+"Stop words" are the most common words used in a language and a "stop list" is a list of stop words. In the context of these tokenizers, they are more like "stop text chunks". When text is processed by the BatchBPE tokenizers, it gets split according to the split_pattern you use (default is GPT4 split pattern). The X most common of these chunks can be assigned individual tokens before the normal BPE vocabulary building process begins. This will assign special tokens to common 2+ character text chunks like " the", " in" ".\n", etc. BatchBPE automates this by letting you pass the `stop_list_size` param to the tokenizer on instantiation. Like this:
+
+```python
+from batchbpe import BatchTokenizer
+tokenizer = BatchTokenizer(stop_list_size=100)
+data = 'full_path_to_json_file'
+tokenizer.train(data, 50304, verbose=True)
+```
+
+Why would you do this when the most common text chunks already get represented by their own tokens in the normal BPE vocabulary building process? The distribution of text chunk frequencies overwhelming favors these stop words, so if you don't handle them explicitly, then the token merges will begin on a path that caters to them exclusively. Since earlier merges impact later merges, this may not be the most effective way to shape the entire vocabulary.
+
+For example, consider the text chunk " in". As a standalone word, " in" describes location or membership. But as a prefix, " in" usually indicates negation which is close to the opposite of the stop word " in". Since the stop list tokens are only applied to text chunks if they match the entire text chunk, you can easily avoid this semantic pollution from the stop words. Another token will eventually get created that also points to the characters " in", but that one will be free to participate in further merges inside text chunks like " inaccessible". The `stop_list_size` feature lets you dynamically apply this approach to the X most common multi-character text chunks in your dataset. This effectively allows for a mix of word-level and byte-level encoding. Just don't get too carried away with the `stop_list_size` since it eats into your vocabulary size.
 
 ### Frequency Cutoff
 
-### Compress Text into Dictionary Representation
+The `freq_cutoff` parameter addresses the opposite problem: a very high percentage of text chunks in a dataset only occur once or a handful of times. If you want to enforce a threshhold for the number of times a text chunk must appear for it to participate in regular token pair merges, you can do this with `freq_cutoff`. The default value is 1 (i.e. all text chunks are considered) but if you set `freq_cutoff=2`, a text chunk would have to appear at least twice to be considered. This alone can eliminate over half of the unique text chunks in the dataset (obviously highly dependent on dataset) making training twice as fast. More importantly, all that noise from tons of non-repeating text chunks may actually make your tokenization worse. With BatchBPE it's easy to see that applying this kind of threshhold changes the course of the tokenization, but whether or not that change is for the better is up for experimentation.
 
-## Difference Between BatchTokenizer and QuickTokenizer
+The option to have a frequency threshhold follows naturally from the architectural decision to internally represent datasets with a dictionary mapping text chunks to their counts. You apply the parameter at the tokenizer instantiation stage like this:
+
+```python
+from batchbpe import BatchTokenizer
+tokenizer = BatchTokenizer(freq_cutoff=2)
+data = 'full_path_to_json_file'
+tokenizer.train(data, 50304, verbose=True)
+```
 
 ## Tests
 
-We use the pytest library for tests. All of them are located in the `tests/` directory. First `pip install pytest` if you haven't already, then:
+We use the pytest library for tests. All of them are located in the `tests/` directory. First `uv pip install pytest` if you haven't already, then:
 
 ```bash
 $ pytest -v .
