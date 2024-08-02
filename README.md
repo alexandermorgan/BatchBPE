@@ -7,7 +7,7 @@ Here is the shortest useful demonstration of what BatchBPE can do (after install
 ```python
 from batchbpe import QuickTokenizer
 tokenizer = QuickTokenizer()
-data = 'path_to_sample_dict_of_1gb_of_text_with_freq_cutoff_10.json'
+data = 'tests/1GB_of_FineWeb-Edu_10B_sample_freq_cutoff_10.json'
 tokenizer.train(data, 50304, verbose=True)
 ```
 
@@ -64,7 +64,7 @@ Data loading is the same for the Batch and Quick tokenizers. You can load text d
 - path or url to .txt file
 - datasets library Dataset object
 - datasets library IterableDataset object (not recommended)
-- dictionary or path to a json file of a dictionary saved by a previous Tokenizer data import
+- `str: int` dictionary or path to a 2-column csv file of a dictionary saved by a previous Tokenizer data import
 - list/tuple of any combination of the above
 
 HuggingFace's datasets library is great way to get large specialized text datasets, though it can be a little tricky to use. When passing a regular Dataset object, BatchBPE will try to multiprocess the data loading using joblib. This default can be disabled by passing `multiprocess=False` when instantiating your tokenizer. Here's an example of passing a `datasets.Dataset` from a local parquet file.
@@ -121,6 +121,50 @@ tokenizer3.train(paths, 50304)   # now you can train a vocabulary on your full d
 # for later use, the data from all ten files combined will be in the new json file in the same '{date}-{time}-dataset-dict.json' format.
 ```
 
+## Special Features
+
+### Batching Token Pair Merges
+
+If the idea of batching token merges still makes you nervous, you can set `max_batch_size=1` to merge one pair at a time:
+
+```python
+tokenizer = BatchTokenizer()
+path = 'path_to_first_json_file.json'
+tokenizer.train(path, 50304, max_batch_size=1)
+```
+
+### Compress Text into Dictionary Representation
+
+Whatever dataset you pass gets compressed into a dictionary mapping the text chunks (done according to the regex pattern you use) to their counts in the dataset. This is a considerable compression of datasets that is possible given this approach to byte-level merging only within text chunks, not between them. If you like, you can download the entire FineWeb-Edu 10B sample in this dictionary format as a 2-column [csv file I put on HuggingFace](https://huggingface.co/datasets/alexandermorgan/FineWeb-Edu_10B_sample_2_column_word_counts/tree/main). This shrinks the dataset size from \~27 GB spread across 14 parquet files (which are already compressed) to one 240 MB csv file. This is a great speed optimization since you only process each text chunk in the dataset once per batch (weighted for its frequency count), and even more importantly it means that you can work with very large datasets on a basic laptop. As mentioned in above, you can use the `store_dict=True` parameter to save this dictionary representation of your passed dataset as a 2-column csv file.
+
+### Frequency Cutoff
+
+The `freq_cutoff` parameter addresses makes further use of this dictionary representation of datasets. A very high percentage of text chunks in a dataset only occur once or a handful of times. If you want to enforce a threshhold for the number of times a text chunk must appear for it to participate in regular token pair merges, you can do this with `freq_cutoff`. The default value is 1 (i.e. all text chunks are considered) but if you set `freq_cutoff=2`, a text chunk would have to appear at least twice to be considered. This alone can eliminate over half of the unique text chunks in the dataset (obviously highly dependent on dataset) making training twice as fast. More importantly, all that noise from tons of non-repeating text chunks may actually make your tokenization worse. With BatchBPE it's easy to see that applying this kind of threshhold changes the course of the tokenization, but whether or not that change is for the better is up for experimentation.
+
+The option to have a frequency threshhold follows naturally from the architectural decision to internally represent datasets with a dictionary mapping text chunks to their counts. You apply the parameter at the tokenizer instantiation stage like this:
+
+```python
+from batchbpe import BatchTokenizer
+tokenizer = BatchTokenizer(freq_cutoff=2)
+data = 'full_path_to_json_file'
+tokenizer.train(data, 50304, verbose=True)
+```
+
+### Stop Word Handling
+
+"Stop words" are the most common words used in a language and a "stop list" is a list of stop words. In the context of these tokenizers, they are more like "stop text chunks". When text is processed by the BatchBPE tokenizers, it gets split according to the split_pattern you use (default is GPT4 split pattern). The X most common of these chunks can be assigned individual tokens before the normal BPE vocabulary building process begins. This will assign special tokens to common 2+ character text chunks like " the", " in" ".\n", etc. BatchBPE automates this by letting you pass the `stop_list_size` param to the tokenizer on instantiation. Like this:
+
+```python
+from batchbpe import BatchTokenizer
+tokenizer = BatchTokenizer(stop_list_size=100)
+data = 'full_path_to_json_file'
+tokenizer.train(data, 50304, verbose=True)
+```
+
+Why would you do this when the most common text chunks already get represented by their own tokens in the normal BPE vocabulary building process? The distribution of text chunk frequencies overwhelming favors these stop words, so if you don't handle them explicitly, then the token merges will begin on a path that caters to them exclusively. Since earlier merges impact later merges, this may not be the most effective way to shape the entire vocabulary.
+
+For example, consider the text chunk " in". As a standalone word, " in" describes location or membership. But as a prefix, " in" usually indicates negation which is close to the opposite of the stop word " in". Since the stop list tokens are only applied to text chunks if they match the entire text chunk, you can easily avoid this semantic pollution from the stop words. Another token will eventually get created that also points to the characters " in", but that one will be free to participate in further merges inside text chunks like " inaccessible". The `stop_list_size` feature lets you dynamically apply this approach to the X most common multi-character text chunks in your dataset. This effectively allows for a mix of word-level and byte-level encoding. Just don't get too carried away with the `stop_list_size` since it eats into your vocabulary size.
+
 ## Registering Special Tokens
 
 The ability to register special tokens remains in tact from Karpathy's minbpe repo. Note that just like tiktoken, we have to explicitly declare our intent to use and parse special tokens in the call to encode. Otherwise this can become a major footgun, unintentionally tokenizing attacker-controlled data (e.g. user prompts) with special tokens. The `allowed_special` parameter can be set to "all", "none", or a list of special tokens to allow.
@@ -140,48 +184,6 @@ print(tokenizer.encode(text))
 # explicitly set allowed_special='all' to use special tokens
 print(tokenizer.encode(text, allowed_special='all'))
 # [100257, 15339, 1917]
-```
-
-## Special Features
-
-### Batching Token Pair Merges
-
-If the idea of batching token merges still makes you nervous, you can set `max_batch_size=1` to merge one pair at a time:
-
-```python
-tokenizer = BatchTokenizer()
-path = 'path_to_first_json_file.json'
-tokenizer.train(path, 50304, max_batch_size=1)
-```
-
-### Compress Text into Dictionary Representation
-
-### Stop Word Handling
-
-"Stop words" are the most common words used in a language and a "stop list" is a list of stop words. In the context of these tokenizers, they are more like "stop text chunks". When text is processed by the BatchBPE tokenizers, it gets split according to the split_pattern you use (default is GPT4 split pattern). The X most common of these chunks can be assigned individual tokens before the normal BPE vocabulary building process begins. This will assign special tokens to common 2+ character text chunks like " the", " in" ".\n", etc. BatchBPE automates this by letting you pass the `stop_list_size` param to the tokenizer on instantiation. Like this:
-
-```python
-from batchbpe import BatchTokenizer
-tokenizer = BatchTokenizer(stop_list_size=100)
-data = 'full_path_to_json_file'
-tokenizer.train(data, 50304, verbose=True)
-```
-
-Why would you do this when the most common text chunks already get represented by their own tokens in the normal BPE vocabulary building process? The distribution of text chunk frequencies overwhelming favors these stop words, so if you don't handle them explicitly, then the token merges will begin on a path that caters to them exclusively. Since earlier merges impact later merges, this may not be the most effective way to shape the entire vocabulary.
-
-For example, consider the text chunk " in". As a standalone word, " in" describes location or membership. But as a prefix, " in" usually indicates negation which is close to the opposite of the stop word " in". Since the stop list tokens are only applied to text chunks if they match the entire text chunk, you can easily avoid this semantic pollution from the stop words. Another token will eventually get created that also points to the characters " in", but that one will be free to participate in further merges inside text chunks like " inaccessible". The `stop_list_size` feature lets you dynamically apply this approach to the X most common multi-character text chunks in your dataset. This effectively allows for a mix of word-level and byte-level encoding. Just don't get too carried away with the `stop_list_size` since it eats into your vocabulary size.
-
-### Frequency Cutoff
-
-The `freq_cutoff` parameter addresses the opposite problem: a very high percentage of text chunks in a dataset only occur once or a handful of times. If you want to enforce a threshhold for the number of times a text chunk must appear for it to participate in regular token pair merges, you can do this with `freq_cutoff`. The default value is 1 (i.e. all text chunks are considered) but if you set `freq_cutoff=2`, a text chunk would have to appear at least twice to be considered. This alone can eliminate over half of the unique text chunks in the dataset (obviously highly dependent on dataset) making training twice as fast. More importantly, all that noise from tons of non-repeating text chunks may actually make your tokenization worse. With BatchBPE it's easy to see that applying this kind of threshhold changes the course of the tokenization, but whether or not that change is for the better is up for experimentation.
-
-The option to have a frequency threshhold follows naturally from the architectural decision to internally represent datasets with a dictionary mapping text chunks to their counts. You apply the parameter at the tokenizer instantiation stage like this:
-
-```python
-from batchbpe import BatchTokenizer
-tokenizer = BatchTokenizer(freq_cutoff=2)
-data = 'full_path_to_json_file'
-tokenizer.train(data, 50304, verbose=True)
 ```
 
 ## Tests
