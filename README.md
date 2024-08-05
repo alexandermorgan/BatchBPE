@@ -7,7 +7,7 @@ Here is the shortest useful demonstration of what BatchBPE can do (after install
 ```python
 from batchbpe import QuickTokenizer
 tokenizer = QuickTokenizer()
-data = 'tests/1GB_of_FineWeb-Edu_10B_sample_freq_cutoff_10.json'
+data = 'tests/1GB_of_FineWeb-Edu_10B_sample_freq_cutoff_10.csv'
 tokenizer.train(data, 50304, verbose=True)
 ```
 
@@ -100,7 +100,7 @@ data = load_dataset(**kwargs)
 tokenizer.train(data, 50304, verbose=True)
 ```
 
-Instead of streaming datasets, if you want to load datasets that don't fit in memory and/or hard-disk space, I recommend downloading as many of the files of the dataset at a time as possible, then converting those to BatchBPE's json representation of a dataset which is a greater than 100X compression for large datasets, and then deleting the dataset files. Do this for as many groups of files as necessary, then load a list of the json files BatchBPE produced to combine those. For example, the 10B token sample of the FineWeb-Edu dataset is about 27GB spread out among 10 files. Say you only have room for 5 of those files at a time on your computer, you could load the entire dataset in the following way. While this requires a bit more setup, subsequent uses of the json file will be very fast, so you only have to do it once.
+Instead of streaming datasets, if you want to load datasets that don't fit in memory and/or hard-disk space, I recommend downloading as many of the files of the dataset at a time as possible, then converting those to BatchBPE's csv representation of a dataset which is a greater than 100X compression for large datasets, and then deleting the dataset files. Do this for as many groups of files as necessary, then load a list of the csv files BatchBPE produced to combine those. For example, the 10B token sample of the FineWeb-Edu dataset is about 27GB spread out among 10 files. Say you only have room for 5 of those files at a time on your computer, you could load the entire dataset in the following way. While this requires a bit more setup, subsequent uses of the csv file will be very fast, so you only have to do it once.
 
 ```python
 # download 5 files from the dataset before beginning
@@ -110,15 +110,15 @@ paths = ['path_to_parquet_file_1', ... 'path_to_parquet_file_5']
 kwargs = [{'path': 'parquet', 'data_files': {'train': path}, 'split': 'train'} for path in paths]
 data = [load_dataset(**kwg) for kwg in kwargs]
 tokenizer.train(data, 256)   # calling train with vocab_size of 256 will do no merges, but does call _import_data
-# the json file will be saved in the format '{date}-{time}-dataset-dict.json'
+# the csv file will be saved in the format '{date}-{time}-dataset-dict.csv'
 
 # Then delete the five files, download the remaining dataset files and repeat the above with those files.
 
-# Then import the two json file dataset distillations you have. You can also further compress this into one json file for future use.
+# Then import the two csv file dataset distillations you have. You can also further compress this into one csv file for future use.
 tokenizer3 = BatchTokenizer(store_dict=True)
-paths = ['path_to_first_json_file.json', 'path_to_second_json_file.json']
+paths = ['path_to_first_csv_file.csv', 'path_to_second_csv_file.csv']
 tokenizer3.train(paths, 50304)   # now you can train a vocabulary on your full dataset
-# for later use, the data from all ten files combined will be in the new json file in the same '{date}-{time}-dataset-dict.json' format.
+# for later use, the data from all ten files combined will be in the new csv file in the same '{date}-{time}-dataset-dict.csv' format.
 ```
 
 ## Special Features
@@ -129,7 +129,7 @@ If the idea of batching token merges still makes you nervous, you can set `max_b
 
 ```python
 tokenizer = BatchTokenizer()
-path = 'path_to_first_json_file.json'
+path = 'path_to_first_csv_file.csv'
 tokenizer.train(path, 50304, max_batch_size=1)
 ```
 
@@ -146,7 +146,7 @@ The option to have a frequency threshhold follows naturally from the architectur
 ```python
 from batchbpe import BatchTokenizer
 tokenizer = BatchTokenizer(freq_cutoff=2)
-data = 'full_path_to_json_file'
+data = 'full_path_to_csv_file'
 tokenizer.train(data, 50304, verbose=True)
 ```
 
@@ -157,7 +157,7 @@ tokenizer.train(data, 50304, verbose=True)
 ```python
 from batchbpe import BatchTokenizer
 tokenizer = BatchTokenizer(stop_list_size=100)
-data = 'full_path_to_json_file'
+data = 'full_path_to_csv_file'
 tokenizer.train(data, 50304, verbose=True)
 ```
 
