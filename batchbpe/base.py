@@ -13,9 +13,8 @@ from pyarrow import ChunkedArray
 from joblib import Parallel, delayed, cpu_count
 import time
 import os
-import json
 import regex as re
-
+import csv
 
 
 # the main GPT text split patterns, see
@@ -135,9 +134,11 @@ class Tokenizer:
             # convert to ChunkedArray, dict, or str of text to parse
             if isinstance(item, Dataset):
                 item = item.data['text']
-            elif isinstance(item, str) and item.endswith('.json'):   # json file from previous data load
+            elif isinstance(item, str) and item.endswith('.csv'):   # csv file from previous data load
                 with open(item, 'r') as f:
-                    item = json.load(f)
+                    reader = csv.reader(f)
+                    next(reader)
+                    item = {k: int(v) for k, v in reader}
             elif isinstance(item, str):
                 if item.startswith('https://') or item.startswith('http://'):
                     item = requests.get(item).text    # if it's a url, assume it's to a text file
@@ -148,10 +149,10 @@ class Tokenizer:
             if isinstance(item, dict):
                 last_item = item.popitem()
                 if last_item[1] != 0:
-                    print(f'Warning: the json file passed does not seem to have been made by this tokenizer.')
+                    print(f'Warning: the csv file or dictionary passed does not seem to have been made by this tokenizer.')
                     item[last_item[0]] = last_item[1]
                 elif last_item[0] != self.pattern:
-                    print(f'Warning: the dictionary or json file passed did not use the same split pattern.')
+                    print(f'Warning: the dictionary or csv file passed did not use the same split pattern.')
                 ids.update(item)
             elif isinstance(item, str):   # assume the string is the text itself
                 ids.update(re.findall(self.compiled_pattern, item))
@@ -167,16 +168,19 @@ class Tokenizer:
                 for _dict in item:
                     ids.update(re.findall(self.compiled_pattern, _dict['text']))
 
-        if self.store_dict:   # store dict compression of dataset to a json file if requested
+        if self.store_dict:   # store dict compression of dataset to a csv file if requested
             ids[self.pattern] = 0   # store the pattern used to split the text as the last key
-            formatted_time = time.strftime('%Y-%m-%d-%H:%M', time.localtime())
-            filename = f'{formatted_time}-dataset-dict.json'
+            formatted_time = time.strftime('%Y-%m-%d-%H_%M', time.localtime())
+            filename = f'{formatted_time}-dataset-dict.csv'
             try:
-                with open(filename, 'w') as f:
-                    json.dump(ids, f)
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['text_chunk', 'count'])
+                    for key, value in ids.items():
+                        writer.writerow([key, value])
                 print(f"Stored dictionary of {len(ids)} keys to {filename}")
             except:
-                print('Failed to store dictionary of dataset, continuing on to training...')
+                print('Failed to store dictionary of dataset.')
             del ids[self.pattern]   # remove the pattern key from the ids dict
 
         ids = self._id_dict_to_list(ids)
@@ -257,7 +261,7 @@ class Tokenizer:
         with open(model_file, 'r', encoding="utf-8") as f:
             # read the version
             version = f.readline().strip()
-            assert version == "minbpe v1"
+            assert version == "BatchBPE v1"
             # read the pattern
             self.pattern = f.readline().strip()
             # read the special tokens
