@@ -80,10 +80,9 @@ class Tokenizer:
     def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=1):
         # default: vocab size of 256 (all bytes), no merges, no patterns
         self.merges = {} # (int, int) -> int
-        self.pattern = "" # str
         self.special_tokens = {} # str -> int, e.g. {'<|endoftext|>': 100257}
         self.vocab = self._build_vocab() # int -> bytes
-        self.pattern = GPT4_SPLIT_PATTERN if pattern is None else pattern
+        self.pattern = pattern or GPT4_SPLIT_PATTERN
         self.compiled_pattern = re.compile(self.pattern)
         self.multiprocess = multiprocess
         if multiprocess:
@@ -142,9 +141,12 @@ class Tokenizer:
             elif isinstance(item, str):
                 if item.startswith('https://') or item.startswith('http://'):
                     item = requests.get(item).text    # if it's a url, assume it's to a text file
-                elif os.path.isfile(item) and item.endswith('.txt'):
-                    with open(item, 'r', encoding='utf-8') as f:
-                        item = f.read()
+                elif os.path.isfile(item):
+                    if item.endswith('.txt'):
+                        with open(item, 'r', encoding='utf-8') as f:
+                            item = f.read()
+                    elif item.endswith('.parquet'):
+                        item = load_dataset('parquet', data_files=item).data['train'].flatten()[0]
             # process data
             if isinstance(item, dict):
                 last_item = item.popitem()
