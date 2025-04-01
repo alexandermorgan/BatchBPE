@@ -15,7 +15,7 @@ def get_stats(ids):
     returns a defaultdict with the counts of occurrences of all the consecutive
     pairs of integers within each bytes object, multiplied by the integer value
     associated with each key. This function does not count pairs between the last
-    element of one key the first element of the next key. The integer value
+    element of one key and the first element of the next key. The integer value
     associated with each key serves as a multiplier for the count of each pair
     within that object. Consecutive identical pairs within the same bytes object
     are counted only once to avoid overcounting repeat characters.
