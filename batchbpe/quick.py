@@ -17,14 +17,17 @@ def get_stats(ids):
     returns a defaultdict with the counts of occurrences of all the consecutive
     pairs of integers within each bytes object, multiplied by the integer value
     associated with each key. This function does not count pairs between the last
-    element of one key the first element of the next key. The integer value
+    element of one key and the first element of the next key. The integer value
     associated with each key serves as a multiplier for the count of each pair
-    within that object. Consecutive identical pairs within the same bytes object
-    are counted only once to avoid overcounting repeat characters.
+    within that object. This version of get_stats *does* count consecutive
+    identical pairs within the same bytes object, so there is slight overcounting
+    of these token pairs when the same token appears 3+ times in a row. If you
+    want a version that avoids this overcounting, use the get_stats from the batch
+    tokenizer.
 
     Example:
         get_stats({b'abc': 2, b'bcd': 1, b'eee': 1})
-        -> defaultdict(<class 'int'>, {(97, 98): 1, (98, 99): 2, (99, 100): 1, (101, 101): 1})
+        -> defaultdict(<class 'int'>, {(97, 98): 1, (98, 99): 2, (99, 100): 1, (101, 101): 2})
     """
     counts = defaultdict(int)
     for chunk, num in ids:
