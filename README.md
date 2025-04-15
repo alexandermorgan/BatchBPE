@@ -1,12 +1,14 @@
 # BatchBPE
 
-Practical, performant, pure python implementation of a Byte Pair Encoding (BPE) tokenizer. The "Batch" part of the name is for the most characteristic aspect of BatchBPE, which is that it executes token-pair merges safely in batches. ~200 is the average batch size when building a ~50k token vocabulary based on English training texts.
+Practical, performant, pure python implementation of a Byte Pair Encoding (BPE) tokenizer, forked from Karpathy's [minbpe](https://github.com/karpathy/minbpe). The "Batch" part of the name is for the most characteristic aspect of BatchBPE, which is that it executes token-pair merges safely in batches. ~200 is the average batch size when building a ~50k token vocabulary based on English training texts. This average batch size scales with the vocabulary size.
+
+A more involved technical discussion is available in the [BatchBPE arxiv paper](https://arxiv.org/pdf/2408.04653v1).
 
 Here is the shortest useful demonstration of what BatchBPE can do (after installing): load 1GB's worth of text into a tokenizer and train a ~50k token vocabulary. Don't worry, it doesn't download any data:
 
 ```python
-from batchbpe import QuickTokenizer
-tokenizer = QuickTokenizer()
+from batchbpe import BatchTokenizer
+tokenizer = BatchTokenizer()
 data = 'tests/1GB_of_FineWeb-Edu_10B_sample_freq_cutoff_10.csv'
 tokenizer.train(data, 50304, verbose=True)
 ```
@@ -33,6 +35,11 @@ Finally, the script [train.py](train.py) trains is a variant of the example abov
 
 1. Clone this repo: `git clone https://github.com/alexandermorgan/BatchBPE.git`
 2. cd into batchbpe directory, set up a virtual environment and activate it
+    ```bash
+    cd batchbpe
+    python -m venv .venv
+    source .venv/bin/activate
+    ```
 3. `uv pip install requirements.txt`
 
 ## Quick Start
@@ -132,6 +139,8 @@ tokenizer = BatchTokenizer()
 path = 'path_to_first_csv_file.csv'
 tokenizer.train(path, 50304, max_batch_size=1)
 ```
+
+But batching these merges is the most interesting feature of BatchBPE. These are safe in the sense that merges will not be made in the same order as in the standard way, but the resultant vocabulary will still produce the same tokenization results. You can read more about this safe batching process in section 3 of the [BatchBPE arxiv paper](https://arxiv.org/pdf/2408.04653v1).
 
 ### Compress Text into Dictionary Representation
 
