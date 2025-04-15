@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "batchbpe"
+version = "1.0.0"
+description = "Safely batched, pure python BPE tokenizer. Forked from Andrej Karpathy's minbpe."
+authors = [
+    {name = "Alexander Morgan"},
+    {name = "Andrej Karpathy"}
+]
+requires-python = ">=3.9"
+dependencies = [
+    "datasets",
+    "joblib",
+    "regex",
+    "tiktoken",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+] 
