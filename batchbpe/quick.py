@@ -3,7 +3,8 @@ The QuickTokenizer is the same as the BatchTokenizer but combines the get_stats
 and merge_batch functions into one call per batch, and does not safeguard
 against the overcounting of pairs in chunks of text with repeated characters.
 E.g., this tokenizer will count "aaaaa" as 4 "aa" pairs instead of 2 like the
-BatchTokenizer.
+BatchTokenizer. The other difference is that the QuickTokenizer merges token
+pairs and counts pairs in the same function, whereas the BatchTokenizer does not.
 """
 from .base import Tokenizer
 from collections import defaultdict
@@ -40,6 +41,13 @@ def get_stats(ids):
     return counts
 
 def merge_batch_get_stats(ids, pairs):
+    """
+    Given `ids`, a list of 2-tuples of iterables of ints and int values, and
+    `pairs`, a dictionary of 2-tuples of ints and int values, returns a defaultdict
+    with the counts of occurrences of all the consecutive pairs of integers within
+    each bytes object, multiplied by the integer value associated with each key.
+    The merging and pair counting is done together for a small speed up.
+    """
     counts = defaultdict(int)
     for chunk, num in ids:
         last_index = len(chunk) - 1
@@ -54,8 +62,8 @@ def merge_batch_get_stats(ids, pairs):
             if i:
                 counts[(chunk[i-1], chunk[i])] += num
             i = j
-        if i and i == last_index:
-            counts[(chunk[-2], chunk[i])] += num
+        if i and i == last_index:  # the last pair in chunk did not merge
+            counts[(chunk[-2], chunk[-1])] += num
     return counts
 
 class QuickTokenizer(Tokenizer):
@@ -68,6 +76,10 @@ class QuickTokenizer(Tokenizer):
         super().__init__(pattern, multiprocess, store_dict, stop_list_size, freq_cutoff)
 
     def train(self, data, vocab_size, cap_divisor=2, max_batch_size=0, verbose=False):
+        """
+        Trains the tokenizer on the given data to the specified vocab_size. You
+        probably don't want to change the cap_divisor or max_batch_size defaults.
+        """
         t0 = time.time()
         ids = self._import_data(data)   # [(bytes, int)] -> text chunks and their counts
         t1 = time.time()
@@ -108,5 +120,3 @@ class QuickTokenizer(Tokenizer):
                 t2 = time.time()
                 print(f"Batch {batch_count} merged {len(pairs_to_merge)} pairs in {t2-t1:.2f} sec. Merges remaining: {merges_remaining}") # unique words: {len(ids)} processed words: {sum(ids.values())}")
                 t1 = t2
-        self.merges = merges # used in encode()
-        self.vocab = vocab   # used in decode()

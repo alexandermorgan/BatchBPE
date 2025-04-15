@@ -1,7 +1,8 @@
 """
 Lightweight Byte Pair Encoding tokenizer. Merges are safely made in batches
 along with other optimizations to be a practical tool for trying out new
-tokenization strategies.
+tokenization strategies. Unlike the QuickTokenizer, the BatchTokenizer does not
+combine the pair counting and token merging steps into the same function.
 """
 from .base import Tokenizer
 from collections import defaultdict
@@ -28,19 +29,21 @@ def get_stats(ids):
     for chunk, num in ids:
         last_index = len(chunk) - 1
         i = 0
-        prev_pair = ''
         while i < last_index:
             j = i + 1
-            this_pair = (chunk[i], chunk[j])
-            if this_pair != prev_pair:
-                counts[this_pair] += num
-                prev_pair = this_pair
+            counts[(chunk[i], chunk[j])] += num
+            if chunk[i] == chunk[j] and j+1 <= last_index and chunk[i] == chunk[j+1]:
+                i += 2  # skip the next token to avoid overcounting consecutive repeated pairs
             else:
-                prev_pair = ''
-            i = j
+                i = j
     return counts
 
 def merge_batch(ids, pairs):
+    """
+    Given `ids`, a list of 2-tuples of iterables of ints and int values, and
+    `pairs`, a dictionary of 2-tuples of ints and int values, returns a list of
+    2-tuples of iterables of ints and int values with the pairs merged.
+    """
     for chunk, num in ids:
         last_index = len(chunk) - 1
         i = 0
@@ -63,6 +66,10 @@ class BatchTokenizer(Tokenizer):
         super().__init__(pattern, multiprocess, store_dict, stop_list_size, freq_cutoff)
 
     def train(self, data, vocab_size, cap_divisor=2, max_batch_size=0, verbose=False):
+        """
+        Trains the tokenizer on the given data to the specified vocab_size. You
+        probably don't want to change the cap_divisor or max_batch_size defaults.
+        """
         t0 = time.time()
         ids = self._import_data(data)   # [(list_of_int_tokens, int)] -> text chunks and their counts
         t1 = time.time()
@@ -103,5 +110,3 @@ class BatchTokenizer(Tokenizer):
                 t2 = time.time()
                 print(f"Batch {batch_count} merged {len(pairs_to_merge)} pairs in {t2-t1:.2f} sec. Merges remaining: {merges_remaining}")
                 t1 = t2
-        self.merges = merges # used in encode()
-        self.vocab = vocab   # used in decode()

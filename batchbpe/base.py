@@ -1,5 +1,5 @@
 """
-Contains the base Tokenizer class and a few common helper functions, namely the
+Contains the BaseTokenizer class and a few common helper functions, namely the
 tokenizer save/load functionality, the data import/save functionality, and the
 encode/decode methods. To train a tokenizer, use the BatchTokenizer or
 QuickTokenizer subclasses of this Tokenizer class.
@@ -66,7 +66,7 @@ def _process_dicts(batch, compiled_pattern):   # for raw datasets.Dataset
         counter.update(re.findall(compiled_pattern, item))
     return counter
 
-def _process_string_scalar(batch, compiled_pattern):
+def _process_string_scalar(batch, compiled_pattern):  # for pyarrow.ChunkedArray
     counter = Counter()
     for item in batch:
         counter.update(re.findall(compiled_pattern, item.as_py()))
@@ -76,7 +76,10 @@ def _process_string_scalar(batch, compiled_pattern):
 # the base Tokenizer class
 
 class Tokenizer:
-    """Base class for Tokenizers"""
+    """
+    Base class for Tokenizers containing common supporting functionality,
+    but not any actual tokenization logic.
+    """
     def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=1):
         # default: vocab size of 256 (all bytes), no merges, no patterns
         self.merges = {} # (int, int) -> int
@@ -95,6 +98,11 @@ class Tokenizer:
         self.freq_cutoff = freq_cutoff
 
     def _id_dict_to_list(self, ids):
+        """
+        Given a dictionary of token counts, return a list of 2-tuples of bytes
+        objects and their counts, with the stop words separated if the user has
+        set the stop_list_size class attribute to a positive integer.
+        """
         if self.stop_list_size:
             # get twice as many to be sure to be able to get X chunks of length > 1
             top2X = ids.most_common(2*self.stop_list_size)
@@ -122,10 +130,12 @@ class Tokenizer:
             else:
                 return [([*key.encode('utf-8')], val) for key, val in ids.items()]
 
-    def _import_data(self, data):
-        # determine if `data` is a text as a string, a path to a file, a url to
-        # a text document, a dictionary of datasets kwargs, or a list of any of
-        # the above. Return a list of 2-tuples of bytes objects and their counts.
+    def _import_data(self, data) -> list[tuple[bytes, int]]:
+        """
+        Determine if `data` is a text as a string, a path to a file, a url to
+        a text document, a dictionary of datasets kwargs, or a list of any of
+        the above. Return a list of 2-tuples of bytes objects and their counts.
+        """
         ids = Counter()
         if not isinstance(data, (list, tuple)):
             data = (data,)
@@ -291,6 +301,9 @@ class Tokenizer:
 
     @lru_cache(maxsize=131072)
     def _encode_chunk(self, chunk):
+        """
+        Given a chunk of text, return a list of integers representing the tokens.
+        """
         if chunk in self.stop_words:   # TODO: revisit this if statement
             return [self.stop_words[chunk]]
         # return the token chunk as a list of ints, similar to a bytes object
