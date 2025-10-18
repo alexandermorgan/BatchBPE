@@ -1,10 +1,10 @@
 # BatchBPE
 
-Practical, performant, pure python implementation of a Byte Pair Encoding (BPE) tokenizer, forked from Karpathy's [minbpe](https://github.com/karpathy/minbpe). The "Batch" part of the name is for the most characteristic aspect of BatchBPE, which is that it executes token-pair merges safely in batches. ~200 is the average batch size when building a ~50k token vocabulary based on English training texts. This average batch size scales with the vocabulary size.
+Pure-python Byte Pair Encoding (BPE) tokenizer that uses a new batched approach to the BPE algorithm. This batched approach builds a tokenization vocabulary 2-3 orders of magnitude faster than the standard way. This performance improvement scales with the built vocabulary size and is achieved by determining which of the top potential merges are "safe" in that they can be merged simultaneously without altering the resulting vocabulary. This repo is forked from Karpathy's [minbpe](https://github.com/karpathy/minbpe). The purpose of this repo is to give researchers a simple and fast way to experiment with new approaches to tokenization.
 
 A more involved technical discussion is available in the [BatchBPE arxiv paper](https://arxiv.org/pdf/2408.04653v1).
 
-Here is the shortest useful demonstration of what BatchBPE can do (after installing): load 1GB's worth of text into a tokenizer and train a ~50k token vocabulary. Don't worry, it doesn't download any data:
+Here is the shortest useful demonstration of what BatchBPE can do (after installing): load 1GB's worth of text into a tokenizer and train a ~50k token vocabulary. Don't worry, it doesn't download any additional data:
 
 ```python
 from batchbpe import BatchTokenizer
@@ -13,13 +13,13 @@ data = 'tests/1GB_of_FineWeb-Edu_10B_sample_freq_cutoff_10.csv'
 tokenizer.train(data, 50304, verbose=True)
 ```
 
-The example above runs in less than a minute on an old laptop, not bad for a pure python implementation! The purpose of this repo is to be easy to use and tinker with. I hope it helps people think up and quickly try out new tokenization approaches. More details on this below.
+The example above runs in less than a minute on an old laptop, not bad for a pure-python implementation!
 
 ## Origin Story
 
 This repo is a fork of Andrej Karpathy's excellent introduction to the BPE used for LLM tokenization. If you're new to the subject but haven't reviewed Karpathy's resources, definitely start there. He has a [2-hour video lecture](https://www.youtube.com/watch?v=zduSFxRajkE) (and [text version of lecture](https://github.com/karpathy/minbpe/blob/master/lecture.md)), accompanying [minbpe github repo](https://github.com/karpathy/minbpe), and [colab notebook](https://www.youtube.com/redirect?event=video_description&redir_token=QUFFLUhqbEtrVFZtbHhpLUtxWE5aeVNIaUlSNkhpWHdVUXxBQ3Jtc0tuWE9pbHBPZmF2anlYeTZfdTlVXzYyTmREeDNEejZMYnctNk96UnFuMjZBTUVHemkyWjdlWEhYSE56LUNsVFJrakNXeng3NEQxREkwLUFlQWpKa1JHd3JfX3k5dU5TVWFoQzNnWU9XY0lPUElUTUtydw&q=https%3A%2F%2Fcolab.research.google.com%2Fdrive%2F1y0KnCFZvGVf_odSfcNAws6kcDD7HsI0L%3Fusp%3Dsharing&v=zduSFxRajkE). Tokenization is deceptively simple, so a deep dive into the topic is definitely worth it even if you can understand the basics with a 60-second intro.
 
-This BatchBPE repo began as a PR for Karpathy's minbpe but developed to the point where the objective changed. Instead of minbpe's pedagogic purpose, BatchBPE aims to be as practical and easy to modify as possible. The goal is to make it easy for people to try out new tokenization ideas even if they're working with limited compute, memory, or hard-disk resources. A lot of making tokenization more accessible boils down to compute and memory optimizations. Using BatchBPE's fastest combination of settings (described below), you can train a GPT2-sized vocabulary (~50k tokens) on 1GB's worth of training text in well under a minute on an old laptop. So trying out new tokenization ideas can happen very quickly. Equally importantly, the repo is in entirely in python to make it easier for the greatest number of people to try out new ideas.
+This BatchBPE repo began as a PR for Karpathy's minbpe but developed to the point where the objective changed. Instead of minbpe's pedagogic purpose, BatchBPE aims to be as performant as possible while still remaining easy to modify. The goal is to facilitation experimentation of new tokenization ideas even in situations with limited compute, memory, or hard-disk resources. A lot of making tokenization more accessible boils down to compute and memory optimizations. Using BatchBPE's fastest combination of settings (described below), you can train a GPT2-sized vocabulary (~50k tokens) on 1GB's worth of training text in well under a minute on an old laptop. So trying out new tokenization ideas can happen very quickly. Equally importantly, the repo is in entirely in python to make it easier for the greatest number of people to try out new ideas.
 
 ## Two Available Tokenizers
 
@@ -27,9 +27,26 @@ There are two Tokenizers in this repository, both of which can perform the 3 pri
 
 0. [batchbpe/base.py](batchbpe/base.py): Implements the `Tokenizer` class, which is the base class. It has encode/decode and save/load functionality, and also a few common utility functions. This class is not meant to be used directly, but rather to be inherited from.
 1. [batchbpe/batch.py](batchbpe/batch.py): Implements the `BatchTokenizer` which includes a `train` method and `get_stats` and `merge_batch` functions needed to be able to train a new token vocabulary given input text. It inherits all the essentials from the `Tokenizer`.
-2. [batchbpe/quick.py](batchbpe/quick.py): Implements the `QuickTokenizer` which is a small speed optimization of the `BatchTokenizer`. It runs ~8% faster by disregarding the issue of overcounting potential merges in sequences of repeated characters (e.g. "aaaaa" counts as only 2 possible "a"-"a" merges in the `BatchTokenizer`, but 4 in the `QuickTokenizer`), and by combining the `get_stats` and `merge_batch` functions into a single function. More importantly, the `QuickTokenizer` serves as a demonstration of how to implement your own new tokenizer that inherits from `Tokenizer` to test out a new tokenization approach or idea.
+2. [batchbpe/quick.py](batchbpe/quick.py): Implements the `QuickTokenizer` which is a small speed optimization of the `BatchTokenizer`. It runs ~3% faster by disregarding the issue of overcounting potential merges in sequences of repeated characters (e.g. "aaaaa" counts as only 2 possible "a"-"a" merges in the `BatchTokenizer`, but 4 in the `QuickTokenizer`), and by combining the `get_stats` and `merge_batch` functions into a single function. The performance difference used to be larger, but subsequent optimizations equalized the Batch and Quick tokenizers a bit more. More importantly, the `QuickTokenizer` serves as a demonstration of how to implement your own new tokenizer that inherits from `Tokenizer` to test out a new tokenization approach or idea.
 
 Finally, the script [train.py](train.py) trains is a variant of the example above training a BatchTokenizer and a QuickTokenizer for for a 10K vocabulary each. This script runs in under 50 seconds on my bottom-of-the-line apple silicon laptop (2020 mba, m1, 8 GB memory).
+
+## Proof of Batch Merge "Safety"
+
+How can we *prove* that this batched approach to making tokenization merges is safe? The order of merges is necessarily different from an equivalent vocabulary built up in the traditional serial way, so we can't compare the bytes represented by different tokens from each process. Instead, the proof is that the set of bytes strings represented by the tokens in the vocabulary will be the same in both the serial and batched approaches. You can test this by setting the `max_batch_size` parameter of the `train` method to `1` which will force the tokenizers to run serially. Alongside this, build an equivalent vocabulary on the same dataset without passing anything to the `max_batch_size` parameter, then compare the sets of the two tokenizers' `vocab` class attribute dictionary's values. 
+
+```python
+from batchbpe import BatchTokenizer
+
+data = 'tests/1GB_of_FineWeb-Edu_10B_sample_freq_cutoff_10.csv'
+serial  = BatchTokenizer()
+batched = BatchTokenizer()
+serial.train(data, 1000, verbose=True, max_batch_size=1)
+batched.train(data, 1000, verbose=True)  # do not pass anything for max_batch_size
+print(f'Methods equivalent: {set(serial.vocab.values()) == set(batched.vocab.values()}')
+```
+
+This proof depends on the assumption that all tokens in both vocabularies are equally accessible. Given the way the vocabularies are built up, this is equally true for both serial and batched approaches. As long as merges are executed in order at inference time, later tokens that are the result of merging earlier tokens will be "accessible" (i.e. able to be arrived at).
 
 ## Installation
 
