@@ -50,14 +50,11 @@ This proof depends on the assumption that all tokens in both vocabularies are eq
 
 ## Installation
 
-1. Clone this repo: `git clone https://github.com/alexandermorgan/BatchBPE.git`
-2. cd into batchbpe directory, set up a virtual environment and activate it
     ```bash
-    cd batchbpe
-    python -m venv .venv
-    source .venv/bin/activate
+    git clone https://github.com/alexandermorgan/BatchBPE.git
+    cd BatchBPE
+    uv sync
     ```
-3. `uv pip install requirements.txt`
 
 ## Quick Start
 
