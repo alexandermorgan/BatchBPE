@@ -16,6 +16,11 @@ dependencies = [
     "joblib",
     "regex",
     "tiktoken",
+    "requests",
+    "numpy",
+    "pyarrow>=21.0.0",
+    "matplotlib",
+    "psutil",
 ]
 
 [project.optional-dependencies]

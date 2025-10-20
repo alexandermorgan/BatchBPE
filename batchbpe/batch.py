@@ -12,44 +12,44 @@ import time
 
 def get_stats(ids):
     """
-    Given `ids`, a list of 2-tuples of iterables of ints and int values,
-    returns a defaultdict with the counts of occurrences of all the consecutive
-    pairs of integers within each bytes object, multiplied by the integer value
-    associated with each key. This function does not count pairs between the last
-    element of one key and the first element of the next key. The integer value
-    associated with each key serves as a multiplier for the count of each pair
-    within that object. Consecutive identical pairs within the same bytes object
-    are counted only once to avoid overcounting repeat characters.
+    Given `ids`, a list of lists where each list contains a count as the
+    FIRST element followed by tokens, returns a defaultdict with the 
+    counts of occurrences of all consecutive pairs of integers within each 
+    list, multiplied by the count value. Consecutive identical pairs within 
+    the same list are counted only once to avoid overcounting repeat characters.
 
     Example:
-        get_stats([([97, 98, 99], 2), ([98, 99, 100], 1), ([101, 101, 101], 1)])
-        -> defaultdict(<class 'int'>, {(97, 98): 1, (98, 99): 2, (99, 100): 1, (101, 101): 1})
+        get_stats([[2, 97, 98, 99], [1, 98, 99, 100], [1, 101, 101, 101]])
+        -> defaultdict(<class 'int'>, {(97, 98): 2, (98, 99): 3, (99, 100): 1, (101, 101): 1})
     """
     counts = defaultdict(int)
-    for chunk, num in ids:
-        last_index = len(chunk) - 1
-        i = 0
-        while i < last_index:
+    for chunk in ids:
+        second_last_index = len(chunk) - 2  # second-to-last token index
+        i = 1  # Start at index 1 (skip count)
+        while i < second_last_index:
             j = i + 1
-            counts[(chunk[i], chunk[j])] += num
-            if chunk[i] == chunk[j] and j+1 <= last_index and chunk[i] == chunk[j+1]:
+            counts[(chunk[i], chunk[j])] += chunk[0]
+            if chunk[i] == chunk[j] == chunk[i + 2]:
                 i += 2  # skip the next token to avoid overcounting consecutive repeated pairs
             else:
                 i = j
+        if i == second_last_index:
+            counts[(chunk[i], chunk[i + 1])] += chunk[0]
     return counts
 
 def merge_batch(ids, pairs):
     """
-    Given `ids`, a list of 2-tuples of iterables of ints and int values, and
-    `pairs`, a dictionary of 2-tuples of ints and int values, returns a list of
-    2-tuples of iterables of ints and int values with the pairs merged.
+    Given `ids`, a list of numpy arrays where each array contains a count as the
+    FIRST element followed by tokens, and `pairs`, a dictionary of 
+    2-tuples of ints to int values, merges the pairs in-place using the two-pointer method.
     """
-    for chunk, num in ids:
+    pairs_get = pairs.get
+    for chunk in ids:
         last_index = len(chunk) - 1
-        i = 0
+        i = 1
         while i < last_index:
             j = i + 1
-            token = pairs.get((chunk[i], chunk[j]))
+            token = pairs_get((chunk[i], chunk[j]))
             if token is not None:
                 chunk[i] = token
                 del chunk[j]
@@ -106,6 +106,10 @@ class BatchTokenizer(Tokenizer):
             batch_count += 1
             if merges_remaining:   # no need to merge last batch
                 merge_batch(ids, pairs_to_merge)   # replace pairs_to_merge keys in ids with their values
+                # remove chunks that have solidified into a single token
+                if batch_count % 90 == 0:
+                    ids = [chunk for chunk in ids if len(chunk) > 2]
+
             if verbose:
                 t2 = time.time()
                 print(f"Batch {batch_count} merged {len(pairs_to_merge)} pairs in {t2-t1:.2f} sec. Merges remaining: {merges_remaining}")

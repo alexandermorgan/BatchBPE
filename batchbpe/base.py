@@ -99,9 +99,10 @@ class Tokenizer:
 
     def _id_dict_to_list(self, ids):
         """
-        Given a dictionary of token counts, return a list of 2-tuples of bytes
-        objects and their counts, with the stop words separated if the user has
-        set the stop_list_size class attribute to a positive integer.
+        Given a dictionary of token counts, return a list of lists where
+        each list contains the count as the FIRST element followed by tokens.
+        Stop words are separated if the user has set the stop_list_size class 
+        attribute to a positive integer.
         """
         if self.stop_list_size:
             # get twice as many to be sure to be able to get X chunks of length > 1
@@ -110,25 +111,26 @@ class Tokenizer:
             stop_index = index + self.stop_list_size
             stop_words = {}
             for key, val in top2X:
-                if len(key) > 1: # and re.match(r'^ [A-Za-z\'’`]+$[A-Za-z]*', key):
+                if len(key) > 1:
                     stop_words[key] = index
                     self.vocab[index] = key.encode('utf-8')
                     index += 1
                 if index == stop_index:
                     break
             self.stop_words = stop_words
-            if self.freq_cutoff > 1:
-                return [([*key.encode('utf-8')], val) for key, val in ids.items()
-                        if (val >= self.freq_cutoff and key not in self.stop_words)]
-            else:
-                return [([*key.encode('utf-8')], val) for key, val in ids.items()
-                        if key not in self.stop_words]
-        else:   # self.stop_list_size == 0
-            if self.freq_cutoff > 1:
-                return [([*key.encode('utf-8')], val) for key, val in ids.items()
-                        if val >= self.freq_cutoff]
-            else:
-                return [([*key.encode('utf-8')], val) for key, val in ids.items()]
+            
+            result = []
+            for key, val in ids.items():
+                if key not in self.stop_words:
+                    if 1 < self.freq_cutoff > val:
+                        continue
+                    # Count at the beginning, then tokens
+                    chunk = [val, *key.encode('utf-8')]
+                    result.append(chunk)
+            return result
+        elif self.freq_cutoff > 1:
+            return [[val, *key.encode('utf-8')] for key, val in ids.items() if val > self.freq_cutoff]
+        return [[val, *key.encode('utf-8')] for key, val in ids.items()]
 
     def _import_data(self, data) -> list[tuple[bytes, int]]:
         """
