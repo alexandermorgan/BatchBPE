@@ -63,12 +63,6 @@ def render_token(t: bytes) -> str:
     s = replace_control_characters(s)
     return s
 
-def _process_dicts(batch, compiled_pattern):   # for raw datasets.Dataset
-    counter = Counter()
-    for item in batch:
-        counter.update(m.group() for m in re.finditer(compiled_pattern, item))
-    return counter
-
 def _process_string_scalar(batch, compiled_pattern):  # for pyarrow.ChunkedArray
     counter = Counter()
     for item in batch:
