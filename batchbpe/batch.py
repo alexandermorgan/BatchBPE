@@ -39,14 +39,27 @@ def get_stats(ids):
 
 def merge_batch(ids, pairs):
     """
-    Given `ids`, a list of numpy arrays where each array contains a count as the
-    FIRST element followed by tokens, and `pairs`, a dictionary of 
-    2-tuples of ints to int values, merges the pairs in-place using the two-pointer method.
+    Given `ids`, a list of array.array('i') chunks where each array contains a
+    count as the FIRST element followed by tokens, and `pairs`, a dictionary of
+    2-tuples of ints to int values, merges the pairs in-place using the
+    two-pointer method.
     """
+    merge_batch_and_get_stats(ids, pairs)
+
+
+def merge_batch_and_get_stats(ids, pairs):
+    """
+    Merge `pairs` into `ids` in place and return updated pair counts for the
+    merged chunks. Counting uses the same consecutive-repeat guard as
+    get_stats().
+    """
+    counts = defaultdict(int)
     pairs_get = pairs.get
     for chunk in ids:
+        num = chunk[0]
         last_index = len(chunk) - 1
         i = 1
+        two_back = None
         while i < last_index:
             j = i + 1
             token = pairs_get((chunk[i], chunk[j]))
@@ -54,7 +67,20 @@ def merge_batch(ids, pairs):
                 chunk[i] = token
                 del chunk[j]
                 last_index -= 1
+            if i > 1:
+                if chunk[i] == chunk[i - 1]:
+                    if chunk[i] != two_back:
+                        counts[(chunk[i - 1], chunk[i])] += num
+                        two_back = chunk[i]
+                    else:
+                        two_back = None
+                else:
+                    counts[(chunk[i - 1], chunk[i])] += num
+                    two_back = None
             i = j
+        if i > 1 and i == last_index and not (chunk[last_index - 1] == chunk[last_index] == two_back):
+            counts[(chunk[last_index - 1], chunk[last_index])] += num
+    return counts
 
 class BatchTokenizer(Tokenizer):
     def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=0):
@@ -84,33 +110,38 @@ class BatchTokenizer(Tokenizer):
         if max_batch_size < 1:
             max_batch_size = num_merges
 
+        stats = get_stats(ids)
+        seen_first = set[int]()   # tokens seen in the first position in pairs
+        seen_last = set[int]()   # tokens seen in the last position in pairs
+        add_first = seen_first.add
+        add_last = seen_last.add
+        pairs_to_merge = {}
+
         while merges_remaining > 0:
-            seen_first = set()   # tokens seen in the first position in pairs
-            seen_last = set()   # tokens seen in the last position in pairs
-            pairs_to_merge = {}
-            stats = get_stats(ids)   # count the number of times every consecutive pair appears
-            num_pairs_to_search = min(merges_remaining//cap_divisor, len(vocab), max_batch_size) or 1
+            num_pairs_to_search = min(merges_remaining//cap_divisor, curr_vocab_size, max_batch_size) or 1
             top_pairs = nlargest(num_pairs_to_search, stats, key=stats.get)
             for first, last in top_pairs:  # pairs are (first, last) tuples
-                if first in seen_last or last in seen_first:   # unsafe merge
-                    seen_first.add(first)
-                    seen_last.add(last)
+                unsafe = first in seen_last or last in seen_first   # unsafe merge
+                add_first(first)
+                add_last(last)
+                if unsafe:
                     continue # skip this pair but keep looking for safe merges in top_pairs
-                seen_first.add(first)
-                seen_last.add(last)
                 pairs_to_merge[(first, last)] = curr_vocab_size
                 vocab[curr_vocab_size] = vocab[first] + vocab[last]
                 curr_vocab_size += 1
-            merges_remaining -= len(pairs_to_merge)
+            merges_remaining -= (num_pairs_to_merge := len(pairs_to_merge))
             merges.update(pairs_to_merge)  # save the merges
             batch_count += 1
             if merges_remaining:   # no need to merge last batch
-                merge_batch(ids, pairs_to_merge)   # replace pairs_to_merge keys in ids with their values
                 # remove chunks that have solidified into a single token
                 if batch_count % 90 == 0:
                     ids = [chunk for chunk in ids if len(chunk) > 2]
+                stats = merge_batch_and_get_stats(ids, pairs_to_merge)
+                seen_first.clear()
+                seen_last.clear()
+                pairs_to_merge.clear()
 
             if verbose:
                 t2 = time.time()
-                print(f"Batch {batch_count} merged {len(pairs_to_merge)} pairs in {t2-t1:.2f} sec. Merges remaining: {merges_remaining}")
+                print(f"Batch {batch_count} merged {num_pairs_to_merge} pairs in {t2-t1:.2f} sec. Merges remaining: {merges_remaining}")
                 t1 = t2

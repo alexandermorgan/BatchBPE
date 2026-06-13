@@ -10,6 +10,8 @@ from .base import Tokenizer
 from collections import defaultdict
 from heapq import nlargest
 import time
+import threading
+import numpy as np
 
 
 def get_stats(ids):
@@ -31,16 +33,39 @@ def get_stats(ids):
         -> defaultdict(<class 'int'>, {(97, 98): 1, (98, 99): 2, (99, 100): 1, (101, 101): 2})
     """
     counts = defaultdict(int)
-    for chunk, num in ids:
+    for chunk in ids:
         last_index = len(chunk) - 1
-        i = 0
+        i = 1
         while i < last_index:
             j = i + 1
-            counts[(chunk[i], chunk[j])] += num
+            counts[(chunk[i], chunk[j])] += chunk[0]
             i = j
     return counts
 
-def merge_batch_get_stats(ids, pairs):
+def helper(ids, idxs, pairs, counts):
+    pairs_get = pairs.get
+    for idx in range(idxs[0], idxs[1]):
+        chunk = ids[idx]
+        last_index = len(chunk) - 1
+        i = 1
+        while i < last_index:
+            j = i + 1
+            token = pairs_get((chunk[i], chunk[j]))
+            if token is not None:
+                chunk[i] = token
+                del chunk[j]
+                last_index -= 1
+            if 1 < i:
+                counts[chunk[i-1], chunk[i]] += chunk[0]
+            i = j
+        if 1 < i and i == last_index:  # the last pair in chunk did not merge
+            counts[chunk[i-1], chunk[i]] += chunk[0]
+
+def _merge_two_dicts(dict1, dict2):
+    for k, v in dict2.items():
+        dict1[k] += v
+
+def merge_batch_get_stats(ids, indexes, stats, pairs):
     """
     Given `ids`, a list of 2-tuples of iterables of ints and int values, and
     `pairs`, a dictionary of 2-tuples of ints and int values, returns a defaultdict
@@ -48,23 +73,39 @@ def merge_batch_get_stats(ids, pairs):
     each bytes object, multiplied by the integer value associated with each key.
     The merging and pair counting is done together for a small speed up.
     """
-    counts = defaultdict(int)
-    for chunk, num in ids:
-        last_index = len(chunk) - 1
-        i = 0
-        while i < last_index:
-            j = i + 1
-            token = pairs.get((chunk[i], chunk[j]))
-            if token is not None:
-                chunk[i] = token
-                del chunk[j]
-                last_index -= 1
-            if i:
-                counts[(chunk[i-1], chunk[i])] += num
-            i = j
-        if i and i == last_index:  # the last pair in chunk did not merge
-            counts[(chunk[-2], chunk[-1])] += num
-    return counts
+    threads = []
+    # counters = []
+
+    for idxs in indexes:
+        # counts = defaultdict(int)
+        thread = threading.Thread(target=helper, args=(ids, idxs, pairs, stats))
+        thread.start()
+        threads.append(thread)
+        # counters.append(counts)
+
+    for thread in threads:
+        thread.join()
+
+    # t0 = time.time()
+    # c0 = counters[0]
+    # for c in counters[1:]:
+    #     for k, v in c.items():
+    #         c0[k] += v
+
+    # dict_batches = len(id_batches) // 2
+    # while dict_batches:
+    #     d_threads = []
+    #     for i in range(dict_batches):
+    #         thread = threading.Thread(target=_merge_two_dicts, args=(counters[i], counters[i + dict_batches]))
+    #         thread.start()
+    #         d_threads.append(thread)
+        
+    #     for thread in d_threads:
+    #         thread.join()
+    #     dict_batches //= 2
+
+    # print(f"dd combining runtime: {time.time() - t0}")
+    # return counters[0]
 
 class QuickTokenizer(Tokenizer):
     def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=1):
@@ -82,6 +123,12 @@ class QuickTokenizer(Tokenizer):
         """
         t0 = time.time()
         ids = self._import_data(data)   # [(bytes, int)] -> text chunks and their counts
+        num_threads = 4
+        batch_size = len(ids) // num_threads + 1
+        indexes = [
+            (i, min(i + batch_size, len(ids)))
+            for i in range(0, len(ids), batch_size)
+        ]
         t1 = time.time()
         print(f'Time spent loading data: {t1-t0:.2f}')
 
@@ -100,7 +147,10 @@ class QuickTokenizer(Tokenizer):
             seen_last = set()   # tokens seen in the last position in pairs
             pairs_to_merge = {}
             num_pairs_to_search = min(merges_remaining//cap_divisor, len(vocab), max_batch_size) or 1
-            top_pairs = nlargest(num_pairs_to_search, stats, key=stats.get)
+            if isinstance(stats, defaultdict):
+                top_pairs = nlargest(num_pairs_to_search, stats, key=stats.get)
+            # else:
+                
             for first, last in top_pairs:  # pairs are (first, last) tuples
                 if first in seen_last or last in seen_first:   # unsafe merge
                     seen_first.add(first)
@@ -115,7 +165,8 @@ class QuickTokenizer(Tokenizer):
             merges.update(pairs_to_merge)  # save the merges
             batch_count += 1
             if merges_remaining:   # no need to merge last batch
-                stats = merge_batch_get_stats(ids, pairs_to_merge)   # replace pairs_to_merge keys in ids with their values
+                stats = np.zeros((curr_vocab_size - 1, curr_vocab_size - 1), dtype=int)
+                merge_batch_get_stats(ids, indexes, stats, pairs_to_merge)   # replace pairs_to_merge keys in ids with their values
             if verbose:
                 t2 = time.time()
                 print(f"Batch {batch_count} merged {len(pairs_to_merge)} pairs in {t2-t1:.2f} sec. Merges remaining: {merges_remaining}") # unique words: {len(ids)} processed words: {sum(ids.values())}")

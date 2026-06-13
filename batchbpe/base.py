@@ -5,10 +5,11 @@ encode/decode methods. To train a tokenizer, use the BatchTokenizer or
 QuickTokenizer subclasses of this Tokenizer class.
 """
 import unicodedata
+from array import array
 from collections import Counter
 from functools import lru_cache
 import requests
-from datasets import load_dataset, IterableDataset, Dataset
+# from datasets import load_dataset, IterableDataset, Dataset
 from pyarrow import ChunkedArray
 from joblib import Parallel, delayed, cpu_count
 import time
@@ -16,7 +17,9 @@ import os
 import regex as re
 import csv
 
-
+load_dataset = None
+IterableDataset = None
+Dataset = None
 # the main GPT text split patterns, see
 # https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
 GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -63,13 +66,13 @@ def render_token(t: bytes) -> str:
 def _process_dicts(batch, compiled_pattern):   # for raw datasets.Dataset
     counter = Counter()
     for item in batch:
-        counter.update(re.findall(compiled_pattern, item))
+        counter.update(m.group() for m in re.finditer(compiled_pattern, item))
     return counter
 
 def _process_string_scalar(batch, compiled_pattern):  # for pyarrow.ChunkedArray
     counter = Counter()
     for item in batch:
-        counter.update(re.findall(compiled_pattern, item.as_py()))
+        counter.update(m.group() for m in re.finditer(compiled_pattern, item.as_py()))
     return counter
 
 # -----------------------------------------------------------------------------
@@ -104,6 +107,7 @@ class Tokenizer:
         Stop words are separated if the user has set the stop_list_size class 
         attribute to a positive integer.
         """
+        result = []
         if self.stop_list_size:
             # get twice as many to be sure to be able to get X chunks of length > 1
             top2X = ids.most_common(2*self.stop_list_size)
@@ -119,18 +123,19 @@ class Tokenizer:
                     break
             self.stop_words = stop_words
             
-            result = []
-            for key, val in ids.items():
-                if key not in self.stop_words:
-                    if 1 < self.freq_cutoff > val:
-                        continue
-                    # Count at the beginning, then tokens
-                    chunk = [val, *key.encode('utf-8')]
-                    result.append(chunk)
-            return result
-        elif self.freq_cutoff > 1:
-            return [[val, *key.encode('utf-8')] for key, val in ids.items() if val > self.freq_cutoff]
-        return [[val, *key.encode('utf-8')] for key, val in ids.items()]
+            while ids:
+                key, val = ids.popitem()
+                if key in self.stop_words or 1 < self.freq_cutoff > val:
+                    continue
+                # Count at the beginning, then tokens
+                result.append(array('i', [val, *key.encode('utf-8')]))
+        else:
+            while ids:
+                key, val = ids.popitem()
+                if 1 < self.freq_cutoff > val:
+                    continue
+                result.append(array('i', [val, *key.encode('utf-8')]))
+        return result
 
     def _import_data(self, data) -> list[tuple[bytes, int]]:
         """
@@ -143,20 +148,26 @@ class Tokenizer:
             data = (data,)
         for item in data:
             # convert to ChunkedArray, dict, or str of text to parse
-            if isinstance(item, Dataset):
+            if False: #isinstance(item, Dataset):
                 item = item.data['text']
             elif isinstance(item, str) and item.endswith('.csv'):   # csv file from previous data load
                 with open(item, 'r') as f:
                     reader = csv.reader(f)
-                    next(reader)
-                    item = {k: int(v) for k, v in reader}
+                    next(reader)  # skip the headers
+                    for k, v in reader:
+                        ids[k] += int(v)
+                    item = None  # skip the post-loop dict handling block
             elif isinstance(item, str):
                 if item.startswith('https://') or item.startswith('http://'):
                     item = requests.get(item).text    # if it's a url, assume it's to a text file
                 elif os.path.isfile(item):
                     if item.endswith('.txt'):
+                        # stream the file line-by-line into ids so we never
+                        # hold the full text in memory at once
                         with open(item, 'r', encoding='utf-8') as f:
-                            item = f.read()
+                            for line in f:
+                                ids.update(m.group() for m in re.finditer(self.compiled_pattern, line))
+                        item = None  # skip the post-loop string handling block
                     elif item.endswith('.parquet'):
                         item = load_dataset('parquet', data_files=item).data['train'].flatten()[0]
             # process data
@@ -169,18 +180,21 @@ class Tokenizer:
                     print(f'Warning: the dictionary or csv file passed did not use the same split pattern.')
                 ids.update(item)
             elif isinstance(item, str):   # assume the string is the text itself
-                ids.update(re.findall(self.compiled_pattern, item))
+                ids.update(m.group() for m in re.finditer(self.compiled_pattern, item))
             elif isinstance(item, ChunkedArray):
                 batch_size = len(item) // (self._cpus*2) or 1
                 batches = [item[i:i + batch_size] for i in range(0, len(item), batch_size)]
                 print(f'Processing {len(batches)} batches of size {batch_size}')
-                results = Parallel(n_jobs=self._cpus)(delayed(_process_string_scalar)(batch, self.compiled_pattern) for batch in batches)
-                for result in results:  # Aggregate results into one Counter
+                for result in Parallel(n_jobs=self._cpus, return_as='generator')(
+                    delayed(_process_string_scalar)(batch, self.compiled_pattern) for batch in batches
+                ):
                     ids.update(result)
             elif isinstance(item, IterableDataset):
                 print('Serially processing IterableDataset...')
                 for _dict in item:
-                    ids.update(re.findall(self.compiled_pattern, _dict['text']))
+                    ids.update(m.group() for m in re.finditer(self.compiled_pattern, _dict['text']))
+
+        del item
 
         if self.store_dict:   # store dict compression of dataset to a csv file if requested
             ids[self.pattern] = 0   # store the pattern used to split the text as the last key

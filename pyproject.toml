@@ -12,15 +12,14 @@ authors = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "datasets",
     "joblib",
     "regex",
     "tiktoken",
     "requests",
-    "numpy",
     "pyarrow>=21.0.0",
-    "matplotlib",
     "psutil",
+    "numpy>=2.0.2",
+    "pytest>=8.4.2",
 ]
 
 [project.optional-dependencies]

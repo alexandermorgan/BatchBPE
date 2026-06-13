@@ -12,7 +12,7 @@ from .base import Tokenizer
 from .batch import get_stats as p1_get_stats
 from collections import defaultdict
 from heapq import nlargest
-from datasets import load_dataset, IterableDataset, Dataset
+# from datasets import load_dataset, IterableDataset, Dataset
 from pyarrow import ChunkedArray
 from joblib import Parallel, delayed, cpu_count
 import psutil
@@ -183,47 +183,47 @@ class SuperTokenizer(Tokenizer):
         p2_merge_batch_and_get_stats.
         """
         counts = defaultdict(int)
-        for doc_index, doc in enumerate([docs]):
-            if isinstance(doc, str) and doc.endswith('.txt'):
-                print("Warning: Text files are not recommended for phase 2 parsing.\
-                      This will still work but consider using parquet files instead.")
-                with open(doc, "r") as f:
-                    text = f.read()
-                ids = np.array(self.encode(text), dtype=np.int32)
-                _p2_get_stats_helper(counts, ids, f"temp.noindex/{doc_index}.npy")
-            elif isinstance(doc, str) and os.path.isfile(doc) and doc.endswith('.parquet'):
-                articles = load_dataset('parquet', data_files=doc).data['train'].flatten()[0]
-                print(f'{len(articles)} articles in {doc}')
+        # for doc_index, doc in enumerate([docs]):
+        #     if isinstance(doc, str) and doc.endswith('.txt'):
+        #         print("Warning: Text files are not recommended for phase 2 parsing.\
+        #               This will still work but consider using parquet files instead.")
+        #         with open(doc, "r") as f:
+        #             text = f.read()
+        #         ids = np.array(self.encode(text), dtype=np.int32)
+        #         _p2_get_stats_helper(counts, ids, f"temp.noindex/{doc_index}.npy")
+        #     elif isinstance(doc, str) and os.path.isfile(doc) and doc.endswith('.parquet'):
+        #         articles = load_dataset('parquet', data_files=doc).data['train'].flatten()[0]
+        #         print(f'{len(articles)} articles in {doc}')
                 
-                # Parallelize processing with joblib
-                n_jobs = 3  # cpu_count()
-                print(f'Using {n_jobs} cores')
-                article_limit = 100000
-                articles = articles[:article_limit]
-                batch_size = len(articles) // n_jobs + 1
+        #         # Parallelize processing with joblib
+        #         n_jobs = 3  # cpu_count()
+        #         print(f'Using {n_jobs} cores')
+        #         article_limit = 100000
+        #         articles = articles[:article_limit]
+        #         batch_size = len(articles) // n_jobs + 1
                 
-                # Create batches
-                batches = [articles[i:i+batch_size] for i in range(0, len(articles), batch_size)]
+        #         # Create batches
+        #         batches = [articles[i:i+batch_size] for i in range(0, len(articles), batch_size)]
                 
-                # Prepare arguments: first batch gets the counts dict, others get None
-                batch_args = [(batch, doc_index, i*batch_size, self.encode, counts if i == 0 else None) 
-                             for i, batch in enumerate(batches)]
+        #         # Prepare arguments: first batch gets the counts dict, others get None
+        #         batch_args = [(batch, doc_index, i*batch_size, self.encode, counts if i == 0 else None) 
+        #                      for i, batch in enumerate(batches)]
                 
-                # Process articles in parallel batches with modified function signature
-                current_process = psutil.Process()
-                subproc_before = set([p.pid for p in current_process.children(recursive=True)])
-                results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                    delayed(_p2_process_articles_batch)(*args)
-                    for args in batch_args
-                )
-                subproc_after = set([p.pid for p in current_process.children(recursive=True)])
-                for subproc in subproc_after - subproc_before:
-                    print('Killing process with pid {}'.format(subproc))
-                    psutil.Process(subproc).terminate()
-                # Combine counts from all batches (skip the first one since it's already in counts)
-                for result in results[1:]:
-                    for pair, count in result.items():
-                        counts[pair] += count
+        #         # Process articles in parallel batches with modified function signature
+        #         current_process = psutil.Process()
+        #         subproc_before = set([p.pid for p in current_process.children(recursive=True)])
+        #         results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        #             delayed(_p2_process_articles_batch)(*args)
+        #             for args in batch_args
+        #         )
+        #         subproc_after = set([p.pid for p in current_process.children(recursive=True)])
+        #         for subproc in subproc_after - subproc_before:
+        #             print('Killing process with pid {}'.format(subproc))
+        #             psutil.Process(subproc).terminate()
+        #         # Combine counts from all batches (skip the first one since it's already in counts)
+        #         for result in results[1:]:
+        #             for pair, count in result.items():
+        #                 counts[pair] += count
                         
         return counts
 
