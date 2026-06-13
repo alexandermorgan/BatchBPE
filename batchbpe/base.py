@@ -9,7 +9,7 @@ from array import array
 from collections import Counter
 from functools import lru_cache
 import requests
-# from datasets import load_dataset, IterableDataset, Dataset
+from datasets import load_dataset, IterableDataset, Dataset
 from pyarrow import ChunkedArray
 from joblib import Parallel, delayed, cpu_count
 import time
