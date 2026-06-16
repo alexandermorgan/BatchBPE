@@ -91,15 +91,19 @@ class BatchTokenizer(Tokenizer):
         """
         super().__init__(pattern, multiprocess, store_dict, stop_list_size, freq_cutoff)
 
-    def train(self, data, vocab_size, cap_divisor=2, max_batch_size=0, verbose=False):
+    def train(self, data, vocab_size, cap_divisor=2, max_batch_size=0, verbose=False,
+              progress_callback=None):
         """
         Trains the tokenizer on the given data to the specified vocab_size. You
         probably don't want to change the cap_divisor or max_batch_size defaults.
+        progress_callback: optional callable(rows_done, total_rows, batch_rows,
+                           batch_time, elapsed, unique_tokens) called after each
+                           row batch during parquet ingestion.
         """
         t0 = time.time()
-        ids = self._import_data(data)   # [(list_of_int_tokens, int)] -> text chunks and their counts
+        ids = self._import_data(data, progress_callback=progress_callback)
         t1 = time.time()
-        print(f'Time spent loading data: {t1-t0:.2f}')
+        print(f'Time spent loading data: {t1-t0:.2f}s')
 
         merges = self.merges   # {(int, int): int} -> token pair to new token
         vocab = self.vocab   # {int: bytes} -> token to its bytes representation

@@ -12,7 +12,6 @@ authors = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "joblib",
     "regex",
     "tiktoken",
     "requests",

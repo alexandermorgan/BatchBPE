@@ -13,10 +13,8 @@ from .batch import get_stats as p1_get_stats
 from collections import defaultdict
 from heapq import nlargest
 # from datasets import load_dataset, IterableDataset, Dataset
-from pyarrow import ChunkedArray
-from joblib import Parallel, delayed, cpu_count
+from concurrent.futures import ThreadPoolExecutor
 import psutil
-import pdb
 
 def p1_merge_batch_and_get_stats(ids, pairs):
     counts = defaultdict(int)
@@ -57,7 +55,7 @@ def p1_merge_batch_and_get_stats(ids, pairs):
 def p2_merge_batch_and_get_stats(pairs):
     counts = defaultdict(int)
     doc_paths = [f"temp.noindex/{doc}" for doc in os.listdir("temp.noindex")]
-    n_jobs = min(cpu_count(), 3)
+    n_jobs = min(os.cpu_count() or 1, 3)
     docs_per_job = len(doc_paths) // n_jobs + 1
     
     # Process documents in parallel batches
@@ -113,15 +111,8 @@ def p2_merge_batch_and_get_stats(pairs):
     # Use a smaller chunksize for better load balancing
     # Prepare arguments: first batch gets the counts dict, others get None
     batch_args = [(batch, counts if i == 0 else None) for i, batch in enumerate(batches)]
-    current_process = psutil.Process()
-    subproc_before = set([p.pid for p in current_process.children(recursive=True)])
-    results = Parallel(n_jobs=n_jobs, prefer="threads")(
-        delayed(process_batch)(batch, counts_dict) for batch, counts_dict in batch_args
-    )
-    subproc_after = set([p.pid for p in current_process.children(recursive=True)])
-    for subproc in subproc_after - subproc_before:
-        print('Killing process with pid {}'.format(subproc))
-        psutil.Process(subproc).terminate()
+    with ThreadPoolExecutor(max_workers=n_jobs) as pool:
+        results = list(pool.map(lambda args: process_batch(*args), batch_args))
     
     # Combine counts from all batches (skip the first one since it's already in counts)
     combine_start_time = time.time()

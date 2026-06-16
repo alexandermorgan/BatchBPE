@@ -7,19 +7,18 @@ QuickTokenizer subclasses of this Tokenizer class.
 import unicodedata
 from array import array
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import itertools
 from functools import lru_cache
 import requests
-from datasets import load_dataset, IterableDataset, Dataset
+import threading
 from pyarrow import ChunkedArray
-from joblib import Parallel, delayed, cpu_count
 import time
 import os
 import regex as re
 import csv
 
-load_dataset = None
-IterableDataset = None
-Dataset = None
+_tls = threading.local()  # thread-local compiled pattern cache
 # the main GPT text split patterns, see
 # https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
 GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -63,11 +62,19 @@ def render_token(t: bytes) -> str:
     s = replace_control_characters(s)
     return s
 
-def _process_string_scalar(batch, compiled_pattern):  # for pyarrow.ChunkedArray
+def _process_string_scalar(batch, pattern):  # for pyarrow.ChunkedArray
+    # Compile once per thread via thread-local storage. Sharing a single
+    # compiled object across threads segfaults; recompiling every call with
+    # cache_pattern=False is too slow for the GPT-4 pattern.
+    # findall returns strings directly, skipping match object creation.
+    t0 = time.monotonic()
+    if getattr(_tls, 'pattern', None) != pattern:
+        _tls.pattern = pattern
+        _tls.compiled = re.compile(pattern)
     counter = Counter()
     for item in batch:
-        counter.update(m.group() for m in re.finditer(compiled_pattern, item.as_py()))
-    return counter
+        counter.update(_tls.compiled.findall(item.as_py()))
+    return counter, time.monotonic() - t0
 
 # -----------------------------------------------------------------------------
 # the base Tokenizer class
@@ -86,7 +93,7 @@ class Tokenizer:
         self.compiled_pattern = re.compile(self.pattern)
         self.multiprocess = multiprocess
         if multiprocess:
-            self._cpus = cpu_count()
+            self._cpus = min(os.cpu_count(), 8) or 1
         else:
             self._cpus = 1
         self.store_dict = store_dict
@@ -131,7 +138,7 @@ class Tokenizer:
                 result.append(array('i', [val, *key.encode('utf-8')]))
         return result
 
-    def _import_data(self, data) -> list[tuple[bytes, int]]:
+    def _import_data(self, data, progress_callback=None) -> list[tuple[bytes, int]]:
         """
         Determine if `data` is a text as a string, a path to a file, a url to
         a text document, a dictionary of datasets kwargs, or a list of any of
@@ -142,9 +149,7 @@ class Tokenizer:
             data = (data,)
         for item in data:
             # convert to ChunkedArray, dict, or str of text to parse
-            if False: #isinstance(item, Dataset):
-                item = item.data['text']
-            elif isinstance(item, str) and item.endswith('.csv'):   # csv file from previous data load
+            if isinstance(item, str) and item.endswith('.csv'):   # csv file from previous data load
                 with open(item, 'r') as f:
                     reader = csv.reader(f)
                     next(reader)  # skip the headers
@@ -163,7 +168,47 @@ class Tokenizer:
                                 ids.update(m.group() for m in re.finditer(self.compiled_pattern, line))
                         item = None  # skip the post-loop string handling block
                     elif item.endswith('.parquet'):
-                        item = load_dataset('parquet', data_files=item).data['train'].flatten()[0]
+                        import pyarrow.parquet as pq
+                        pf = pq.ParquetFile(item)
+                        total_rows = pf.metadata.num_rows
+                        row_batch_size = max(1, total_rows // (self._cpus * 40))
+                        rows_done = 0
+                        t_load = time.monotonic()
+                        batch_iter = pf.iter_batches(columns=['text'], batch_size=row_batch_size)
+                        # future -> batch_rows; always keep _cpus futures in-flight.
+                        # as_completed returns whichever finishes first so a free
+                        # thread is never waiting on a slower sibling.
+                        futures = {}
+
+                        def _collect(future, batch_rows):
+                            nonlocal rows_done
+                            counter, batch_time = future.result()
+                            ids.update(counter)
+                            rows_done += batch_rows
+                            elapsed = time.monotonic() - t_load
+                            if progress_callback is not None:
+                                progress_callback(rows_done=rows_done, total_rows=total_rows,
+                                                  batch_rows=batch_rows, batch_time=batch_time,
+                                                  elapsed=elapsed, unique_tokens=len(ids))
+                            else:
+                                print(f"  parquet {rows_done:,}/{total_rows:,} rows"
+                                      f"  {batch_rows/batch_time:,.0f} rows/s"
+                                      f"  {len(ids):,} unique tokens", flush=True)
+
+                        with ProcessPoolExecutor(max_workers=self._cpus) as pool:
+                            for rb in itertools.islice(batch_iter, self._cpus):
+                                chunk = rb.column('text')
+                                f = pool.submit(_process_string_scalar, chunk, self.pattern)
+                                futures[f] = len(chunk)
+                            for rb in batch_iter:
+                                chunk = rb.column('text')
+                                done = next(as_completed(futures))
+                                _collect(done, futures.pop(done))
+                                f = pool.submit(_process_string_scalar, chunk, self.pattern)
+                                futures[f] = len(chunk)
+                            for done in as_completed(futures):
+                                _collect(done, futures.pop(done))
+                        item = None  # skip the post-loop handling block
             # process data
             if isinstance(item, dict):
                 last_item = item.popitem()
@@ -179,14 +224,15 @@ class Tokenizer:
                 batch_size = len(item) // (self._cpus*2) or 1
                 batches = [item[i:i + batch_size] for i in range(0, len(item), batch_size)]
                 print(f'Processing {len(batches)} batches of size {batch_size}')
-                for result in Parallel(n_jobs=self._cpus, return_as='generator')(
-                    delayed(_process_string_scalar)(batch, self.compiled_pattern) for batch in batches
-                ):
-                    ids.update(result)
-            elif isinstance(item, IterableDataset):
-                print('Serially processing IterableDataset...')
-                for _dict in item:
-                    ids.update(m.group() for m in re.finditer(self.compiled_pattern, _dict['text']))
+                with ProcessPoolExecutor(max_workers=self._cpus) as pool:
+                    for counter, _ in pool.map(
+                        _process_string_scalar,
+                        batches,
+                        [self.pattern] * len(batches),
+                    ):
+                        ids.update(counter)
+            elif item is not None:
+                print(f'Warning: unrecognised data type {type(item)}, skipping.')
 
         del item
 
