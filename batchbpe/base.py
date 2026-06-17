@@ -93,7 +93,7 @@ class Tokenizer:
         self.compiled_pattern = re.compile(self.pattern)
         self.multiprocess = multiprocess
         if multiprocess:
-            self._cpus = min(os.cpu_count(), 8) or 1
+            self._cpus = os.cpu_count()
         else:
             self._cpus = 1
         self.store_dict = store_dict
