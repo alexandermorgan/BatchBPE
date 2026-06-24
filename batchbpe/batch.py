@@ -4,28 +4,29 @@ along with other optimizations to be a practical tool for trying out new
 tokenization strategies. Unlike the QuickTokenizer, the BatchTokenizer does not
 combine the pair counting and token merging steps into the same function.
 """
-from typing import Any
 from .base import Tokenizer
+from array import array
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from heapq import nlargest
+from itertools import batched
 import time
 
 
-def _shards(seq, n):
-    """Split `seq` into at most `n` contiguous slices for parallel workers."""
+def _shards(seq: list[array[int]], n: int) -> batched[tuple[array[int], ...]]:
+    """Split `seq` into at most `n` contiguous batches for parallel workers."""
     size = (len(seq) + n - 1) // n or 1
-    return [seq[i:i + size] for i in range(0, len(seq), size)]
+    return batched(seq, size)
 
 
-def _merge_two(a, b):
+def _merge_two(a: defaultdict[int, int], b: defaultdict[int, int]) -> defaultdict[int, int]:
     """Sum count dict `b` into `a` (the larger of the two) and return it."""
     for k, v in b.items():
         a[k] += v
     return a
 
 
-def _combine_counts(parts, pool):
+def _combine_counts(parts: list[defaultdict[int, int]], pool: ThreadPoolExecutor) -> defaultdict[int, int]:
     """Sum a list of packed-int count dicts into one (the global pair stats).
 
     Reduced as a balanced binary tree: each wave merges disjoint pairs of dicts
@@ -42,7 +43,7 @@ def _combine_counts(parts, pool):
     return parts[0]
 
 
-def get_stats(ids, mult):
+def get_stats(ids: list[array[int]], mult: int) -> defaultdict[int, int]:
     """
     Given `ids`, a list of lists where each list contains a count as the
     FIRST element followed by tokens, returns a defaultdict with the 
@@ -59,36 +60,31 @@ def get_stats(ids, mult):
         get_stats([[2, 97, 98, 99], [1, 98, 99, 100], [1, 101, 101, 101]], 1000)
         -> defaultdict(<class 'int'>, {97098: 2, 98099: 3, 99100: 1, 101101: 1})
     """
-    counts = defaultdict(int)
+    counts = defaultdict[int, int](int)
     for chunk in ids:
+        num = chunk[0]
         second_last_index = len(chunk) - 2  # second-to-last token index
         i = 1  # Start at index 1 (skip count)
         while i < second_last_index:
             j = i + 1
-            counts[chunk[i] * mult + chunk[j]] += chunk[0]
+            counts[chunk[i] * mult + chunk[j]] += num
             if chunk[i] == chunk[j] == chunk[i + 2]:
                 i += 2  # skip the next token to avoid overcounting consecutive repeated pairs
             else:
                 i = j
         if i == second_last_index:
-            counts[chunk[i] * mult + chunk[i + 1]] += chunk[0]
+            counts[chunk[i] * mult + chunk[i + 1]] += num
     return counts
 
 
-def merge_batch_and_get_stats(ids, pairs, mult):
+def merge_batch_and_get_stats(ids: list[array[int]], pairs: dict[int, int], mult: int) -> defaultdict[int, int]:
     """
     Merge `pairs` into `ids` in place and return updated pair counts for the
-    merged chunks. Counting uses the same consecutive-repeat guard as
-    get_stats().
-
-    Both `pairs` and the returned counts are keyed by the packed int
-    `first*mult + last` instead of a `(first, last)` tuple, which avoids
-    allocating a tuple for every pair lookup/count in the hot loop. `mult`
-    must exceed the largest token id (vocab_size).
-
-    The merge and the recount run as two separate passes (faster than a fused
-    pass, as each is a tighter, more branch-predictable loop). Called per shard
-    by train(); the recount is exactly get_stats() over the just-merged chunks.
+    merged chunks. Both `pairs` and the returned counts are keyed by the packed
+    int `first*mult + last`. The merge and the recount run as two separate passes
+    (faster than a fused pass, as each is a tighter, more branch-predictable loop).
+    Called per shard by train(); the recount is exactly get_stats() over the
+    just-merged chunks.
     """
     pairs_get = pairs.get
     # --- merge pass: apply pairs to every chunk in place ---
@@ -104,24 +100,10 @@ def merge_batch_and_get_stats(ids, pairs, mult):
                 last_index -= 1
             i = j
     # --- count pass: recompute pair stats over the merged chunks ---
-    counts = defaultdict(int)
-    for chunk in ids:
-        num = chunk[0]
-        second_last_index = len(chunk) - 2
-        i = 1
-        while i < second_last_index:
-            j = i + 1
-            counts[chunk[i] * mult + chunk[j]] += num
-            if chunk[i] == chunk[j] == chunk[i + 2]:
-                i += 2  # skip the next token to avoid overcounting consecutive repeated pairs
-            else:
-                i = j
-        if i == second_last_index:
-            counts[chunk[i] * mult + chunk[i + 1]] += num
-    return counts
+    return get_stats(ids, mult)
 
 class BatchTokenizer(Tokenizer):
-    def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=0):
+    def __init__(self, pattern: str | None = None, multiprocess: bool = True, store_dict: bool = False, stop_list_size: int = 0, freq_cutoff: int = 0) -> None:
         """
         - pattern: optional string to override the default (GPT-4 split pattern)
         - special_tokens: str -> int dictionary of special tokens
@@ -129,17 +111,14 @@ class BatchTokenizer(Tokenizer):
         """
         super().__init__(pattern, multiprocess, store_dict, stop_list_size, freq_cutoff)
 
-    def train(self, data, vocab_size, cap_divisor=2, max_batch_size=0, verbose=False,
-              progress_callback=None):
+    def train(self, data: str | list[str], vocab_size: int, cap_divisor: int = 2,
+              max_batch_size: int = 0, verbose: bool = False) -> None:
         """
         Trains the tokenizer on the given data to the specified vocab_size. You
         probably don't want to change the cap_divisor or max_batch_size defaults.
-        progress_callback: optional callable(rows_done, total_rows, batch_rows,
-                           batch_time, elapsed, unique_tokens) called after each
-                           row batch during parquet ingestion.
         """
         t0 = time.time()
-        ids = self._import_data(data, progress_callback=progress_callback)
+        ids = self._import_data(data)
         t1 = time.time()
         print(f'Time spent loading data: {t1-t0:.2f}s')
 
@@ -167,9 +146,10 @@ class BatchTokenizer(Tokenizer):
         # disjoint slice of `ids` (distinct chunk objects, so the in-place merge is
         # safe under free-threaded Python) and returns a local count dict, which the
         # main thread sums into the global stats. The pool is reused across batches.
+        shards = [*_shards(ids, n)]
         with ThreadPoolExecutor(max_workers=n) as pool:
             stats = _combine_counts(list(pool.map(
-                lambda shard: get_stats(shard, mult), _shards(ids, n))), pool)
+                lambda shard: get_stats(shard, mult), shards)), pool)
 
             while merges_remaining > 0:
                 num_pairs_to_search = min(merges_remaining//cap_divisor, curr_vocab_size, max_batch_size) or 1
@@ -187,16 +167,14 @@ class BatchTokenizer(Tokenizer):
                     curr_vocab_size += 1
                 merges_remaining -= (num_pairs_to_merge := len(pairs_to_merge))
                 batch_count += 1
-                if merges_remaining:   # no need to merge last batch
-                    # remove chunks that have solidified into a single token
-                    if batch_count % 90 == 0:
-                        ids = [chunk for chunk in ids if len(chunk) > 2]
-                    stats = _combine_counts(list[defaultdict[int, int]](pool.map(
-                        lambda shard: merge_batch_and_get_stats(shard, pairs_to_merge, mult),
-                        _shards(ids, n))), pool)
-                    seen_first.clear()
-                    seen_last.clear()
-                    pairs_to_merge.clear()
+                # if not merges_remaining:   # no need to merge last batch
+                #     break
+                stats = _combine_counts(list(pool.map(
+                    lambda shard: merge_batch_and_get_stats(shard, pairs_to_merge, mult),
+                    shards)), pool)
+                seen_first.clear()
+                seen_last.clear()
+                pairs_to_merge.clear()
 
                 if verbose:
                     t2 = time.time()

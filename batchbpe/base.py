@@ -8,11 +8,11 @@ import unicodedata
 from array import array
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import itertools
+from itertools import batched, islice
 from functools import lru_cache
 import requests
 import threading
-from pyarrow import ChunkedArray
+from pyarrow import ChunkedArray, parquet
 import time
 import os
 import regex as re
@@ -93,7 +93,7 @@ class Tokenizer:
         self.compiled_pattern = re.compile(self.pattern)
         self.multiprocess = multiprocess
         if multiprocess:
-            self._cpus = os.cpu_count()
+            self._cpus = 8 # os.cpu_count() or 1
         else:
             self._cpus = 1
         self.store_dict = store_dict
@@ -131,14 +131,14 @@ class Tokenizer:
                 # Count at the beginning, then tokens
                 result.append(array('i', [val, *key.encode('utf-8')]))
         else:
-            while ids:
-                key, val = ids.popitem()
-                if 1 < self.freq_cutoff > val:
-                    continue
-                result.append(array('i', [val, *key.encode('utf-8')]))
+            result = [
+                array('i', [val, *key.encode('utf-8')])
+                for key, val in ids.items()
+                if not (1 < self.freq_cutoff > val)
+            ]
         return result
 
-    def _import_data(self, data, progress_callback=None) -> list[tuple[bytes, int]]:
+    def _import_data(self, data) -> list[tuple[bytes, int]]:
         """
         Determine if `data` is a text as a string, a path to a file, a url to
         a text document, a dictionary of datasets kwargs, or a list of any of
@@ -168,12 +168,10 @@ class Tokenizer:
                                 ids.update(m.group() for m in re.finditer(self.compiled_pattern, line))
                         item = None  # skip the post-loop string handling block
                     elif item.endswith('.parquet'):
-                        import pyarrow.parquet as pq
-                        pf = pq.ParquetFile(item)
+                        pf = parquet.ParquetFile(item)
                         total_rows = pf.metadata.num_rows
                         row_batch_size = max(1, total_rows // (self._cpus * 40))
                         rows_done = 0
-                        t_load = time.monotonic()
                         batch_iter = pf.iter_batches(columns=['text'], batch_size=row_batch_size)
                         # future -> batch_rows; always keep _cpus futures in-flight.
                         # as_completed returns whichever finishes first so a free
@@ -185,18 +183,12 @@ class Tokenizer:
                             counter, batch_time = future.result()
                             ids.update(counter)
                             rows_done += batch_rows
-                            elapsed = time.monotonic() - t_load
-                            if progress_callback is not None:
-                                progress_callback(rows_done=rows_done, total_rows=total_rows,
-                                                  batch_rows=batch_rows, batch_time=batch_time,
-                                                  elapsed=elapsed, unique_tokens=len(ids))
-                            else:
-                                print(f"  parquet {rows_done:,}/{total_rows:,} rows"
-                                      f"  {batch_rows/batch_time:,.0f} rows/s"
-                                      f"  {len(ids):,} unique tokens", flush=True)
+                            print(f"  parquet {rows_done:,}/{total_rows:,} rows"
+                                  f"  {batch_rows/batch_time:,.0f} rows/s"
+                                  f"  {len(ids):,} unique tokens", flush=True)
 
                         with ProcessPoolExecutor(max_workers=self._cpus) as pool:
-                            for rb in itertools.islice(batch_iter, self._cpus):
+                            for rb in islice(batch_iter, self._cpus):
                                 chunk = rb.column('text')
                                 f = pool.submit(_process_string_scalar, chunk, self.pattern)
                                 futures[f] = len(chunk)
@@ -222,7 +214,7 @@ class Tokenizer:
                 ids.update(m.group() for m in re.finditer(self.compiled_pattern, item))
             elif isinstance(item, ChunkedArray):
                 batch_size = len(item) // (self._cpus*2) or 1
-                batches = [item[i:i + batch_size] for i in range(0, len(item), batch_size)]
+                batches = [*batched(item, batch_size)]
                 print(f'Processing {len(batches)} batches of size {batch_size}')
                 with ProcessPoolExecutor(max_workers=self._cpus) as pool:
                     for counter, _ in pool.map(
