@@ -68,10 +68,14 @@ def _process_string_scalar(batch, pattern):  # for pyarrow.ChunkedArray
     # cache_pattern=False is too slow for the GPT-4 pattern.
     # findall returns strings directly, skipping match object creation.
     t0 = time.monotonic()
+    counter = Counter()
+    if pattern is None:   # open-field: each document is a single chunk
+        for item in batch:
+            counter[item.as_py()] += 1
+        return counter, time.monotonic() - t0
     if getattr(_tls, 'pattern', None) != pattern:
         _tls.pattern = pattern
         _tls.compiled = re.compile(pattern)
-    counter = Counter()
     for item in batch:
         counter.update(_tls.compiled.findall(item.as_py()))
     return counter, time.monotonic() - t0
@@ -84,16 +88,16 @@ class Tokenizer:
     Base class for Tokenizers containing common supporting functionality,
     but not any actual tokenization logic.
     """
-    def __init__(self, pattern=None, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=1):
+    def __init__(self, pattern=GPT4_SPLIT_PATTERN, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=1):
         # default: vocab size of 256 (all bytes), no merges, no patterns
         self.merges = {} # (int, int) -> int
         self.special_tokens = {} # str -> int, e.g. {'<|endoftext|>': 100257}
         self.vocab = self._build_vocab() # int -> bytes
-        self.pattern = pattern or GPT4_SPLIT_PATTERN
-        self.compiled_pattern = re.compile(self.pattern)
+        self.pattern = pattern
+        self.compiled_pattern = re.compile(self.pattern) if self.pattern is not None else None
         self.multiprocess = multiprocess
         if multiprocess:
-            self._cpus = 8 # os.cpu_count() or 1
+            self._cpus = os.cpu_count() or 1
         else:
             self._cpus = 1
         self.store_dict = store_dict
@@ -101,14 +105,21 @@ class Tokenizer:
         self.stop_words = {}
         self.freq_cutoff = freq_cutoff
 
-    def _id_dict_to_list(self, ids):
+    def _id_dict_to_list(self, ids, *, encode_with_vocab: bool = False):
         """
         Given a dictionary of token counts, return a list of lists where
         each list contains the count as the FIRST element followed by tokens.
         Stop words are separated if the user has set the stop_list_size class 
         attribute to a positive integer.
+
+        Fresh BPE (encode_with_vocab=False): each chunk becomes raw UTF-8 bytes.
+        New split wave with an existing vocabulary (encode_with_vocab=True): each
+        chunk is encoded with the current merges first, so pair counts reflect
+        the stage-1 token ids rather than relearned byte pairs.
         """
         result = []
+        str_encode = str.encode
+        encode = self._encode_chunk_core if encode_with_vocab else (lambda k: str_encode(k, 'utf-8'))
         if self.stop_list_size:
             # get twice as many to be sure to be able to get X chunks of length > 1
             top2X = ids.most_common(2*self.stop_list_size)
@@ -118,7 +129,7 @@ class Tokenizer:
             for key, val in top2X:
                 if len(key) > 1:
                     stop_words[key] = index
-                    self.vocab[index] = key.encode('utf-8')
+                    self.vocab[index] = str_encode(key, 'utf-8')
                     index += 1
                 if index == stop_index:
                     break
@@ -129,16 +140,16 @@ class Tokenizer:
                 if key in self.stop_words or 1 < self.freq_cutoff > val:
                     continue
                 # Count at the beginning, then tokens
-                result.append(array('i', [val, *key.encode('utf-8')]))
+                result.append(array('i', [val, *encode(key)]))
         else:
             result = [
-                array('i', [val, *key.encode('utf-8')])
+                array('i', [val, *encode(key)])
                 for key, val in ids.items()
                 if not (1 < self.freq_cutoff > val)
             ]
         return result
 
-    def _import_data(self, data) -> list[tuple[bytes, int]]:
+    def _import_data(self, data, *, encode_with_vocab: bool = False) -> list[tuple[bytes, int]]:
         """
         Determine if `data` is a text as a string, a path to a file, a url to
         a text document, a dictionary of datasets kwargs, or a list of any of
@@ -161,11 +172,12 @@ class Tokenizer:
                     item = requests.get(item).text    # if it's a url, assume it's to a text file
                 elif os.path.isfile(item):
                     if item.endswith('.txt'):
-                        # stream the file line-by-line into ids so we never
-                        # hold the full text in memory at once
                         with open(item, 'r', encoding='utf-8') as f:
-                            for line in f:
-                                ids.update(m.group() for m in re.finditer(self.compiled_pattern, line))
+                            if self.compiled_pattern is None:   # open-field: whole file is one chunk
+                                ids[f.read()] += 1
+                            else:
+                                for line in f:
+                                    ids.update(m.group() for m in re.finditer(self.compiled_pattern, line))
                         item = None  # skip the post-loop string handling block
                     elif item.endswith('.parquet'):
                         pf = parquet.ParquetFile(item)
@@ -211,7 +223,10 @@ class Tokenizer:
                     print(f'Warning: the dictionary or csv file passed did not use the same split pattern.')
                 ids.update(item)
             elif isinstance(item, str):   # assume the string is the text itself
-                ids.update(m.group() for m in re.finditer(self.compiled_pattern, item))
+                if self.compiled_pattern is None:   # open-field: whole string is one chunk
+                    ids[item] += 1
+                else:
+                    ids.update(m.group() for m in re.finditer(self.compiled_pattern, item))
             elif isinstance(item, ChunkedArray):
                 batch_size = len(item) // (self._cpus*2) or 1
                 batches = [*batched(item, batch_size)]
@@ -243,7 +258,7 @@ class Tokenizer:
                 print('Failed to store dictionary of dataset.')
             del ids[self.pattern]   # remove the pattern key from the ids dict
 
-        ids = self._id_dict_to_list(ids)
+        ids = self._id_dict_to_list(ids, encode_with_vocab=encode_with_vocab)
         return ids
 
     def train(self, text, vocab_size, verbose=False):
@@ -277,7 +292,8 @@ class Tokenizer:
         with open(model_file, 'w') as f:
             # write the version, pattern and merges, that's all that's needed
             f.write("BatchBPE v1\n")
-            f.write(f"{self.pattern}\n")
+            # open-field (pattern is None) is written as an empty line
+            f.write(f"{self.pattern if self.pattern is not None else ''}\n")
             # write the special tokens, first the number of them, then each one
             f.write(f"{len(self.special_tokens)}\n")
             for special, idx in self.special_tokens.items():
@@ -322,8 +338,8 @@ class Tokenizer:
             # read the version
             version = f.readline().strip()
             assert version == "BatchBPE v1"
-            # read the pattern
-            self.pattern = f.readline().strip()
+            # read the pattern (an empty line means open-field / no splitting)
+            self.pattern = f.readline().strip() or None
             # read the special tokens
             num_special = int(f.readline().strip())
             for _ in range(num_special):
@@ -337,6 +353,7 @@ class Tokenizer:
         self.merges = merges
         self.special_tokens = special_tokens
         self.vocab = self._build_vocab()
+        self.compiled_pattern = re.compile(self.pattern) if self.pattern is not None else None
 
     def decode(self, ids):
         # given ids (list of integers), return Python string
@@ -347,22 +364,24 @@ class Tokenizer:
         text = text_bytes.decode("utf-8", errors="replace")
         return text
 
-    @lru_cache(maxsize=131072)
-    def _encode_chunk(self, chunk):
+    def _encode_chunk_core(self, chunk):
         """
         Given a chunk of text, return a list of integers representing the tokens.
+        Uncached so it is safe to call during training (while self.merges is
+        still growing between stages) without polluting the inference cache.
         """
         if chunk in self.stop_words:   # TODO: revisit this if statement
             return [self.stop_words[chunk]]
         # return the token chunk as a list of ints, similar to a bytes object
         chunk = [*chunk.encode("utf-8")]
         len_chunk = len(chunk)
+        merges_get = self.merges.get
         while len_chunk >= 2:
             # find the pair with the lowest merge index
             low = 987654321
             for i in range(len_chunk - 1):
                 current_pair = (chunk[i], chunk[i+1])
-                new_val = self.merges.get(current_pair, 987654321)
+                new_val = merges_get(current_pair, 987654321)
                 if new_val < low:
                     pair = current_pair
                     low = new_val
@@ -373,8 +392,15 @@ class Tokenizer:
             len_chunk = merge(chunk, pair, idx, len_chunk)
         return chunk   # list of ints
 
+    @lru_cache(maxsize=131072)
+    def _encode_chunk(self, chunk):
+        """Cached wrapper around _encode_chunk_core, used by encode()."""
+        return self._encode_chunk_core(chunk)
+
     def encode_ordinary(self, text):
         """Encoding that ignores any special tokens."""
+        if self.compiled_pattern is None:   # open-field: no splitting
+            return self._encode_chunk(text)
         ids = []
         for chunk in re.findall(self.compiled_pattern, text):
             ids.extend(self._encode_chunk(chunk))

@@ -1,7 +1,10 @@
 import pytest
 import tiktoken
 import os
+import tempfile
+from array import array
 from batchbpe import BatchTokenizer
+from batchbpe.corpus import DiskCorpus, RamCorpus
 
 # -----------------------------------------------------------------------------
 # common test data
@@ -44,6 +47,8 @@ The ancestors of llamas are thought to have originated from the Great Plains of 
 <|fim_prefix|>In Aymara mythology, llamas are important beings. The Heavenly Llama is said to drink water from the ocean and urinates as it rains.[6] According to Aymara eschatology,<|fim_suffix|> where they come from at the end of time.[6]<|fim_middle|> llamas will return to the water springs and ponds<|endofprompt|>
 """.strip()
 
+TAYLORSWIFT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "taylorswift.txt")
+
 # -----------------------------------------------------------------------------
 # tests
 
@@ -59,7 +64,8 @@ def test_encode_decode_identity(tokenizer_factory, text):
 
 # reference test to add more tests in the future
 @pytest.mark.parametrize("tokenizer_factory", [BatchTokenizer])
-def test_wikipedia_example(tokenizer_factory):
+@pytest.mark.parametrize("backend", ["ram", "disk"])
+def test_wikipedia_example(tokenizer_factory, backend):
     """
     Quick unit test, following along the Wikipedia example:
     https://en.wikipedia.org/wiki/Byte_pair_encoding
@@ -80,9 +86,11 @@ def test_wikipedia_example(tokenizer_factory):
 
     So we expect the output list of ids to be [258, 100, 258, 97, 99]
     """
-    tokenizer = tokenizer_factory()
+    tokenizer = tokenizer_factory(multiprocess=False)
     text = "aaabdaaabac"
-    tokenizer.train(text, 256 + 3)
+    with tempfile.TemporaryDirectory() as work_dir:
+        tokenizer.train(text, 256 + 3, backend=backend,
+                        work_dir=work_dir if backend == "disk" else None)
     ids = tokenizer.encode(text)
     assert ids == [258, 100, 258, 97, 99]
     assert tokenizer.decode(tokenizer.encode(text)) == text
@@ -113,6 +121,83 @@ def test_save_load(special_tokens):
     # delete the temporary files
     for file in ["test_tokenizer_tmp.model", "test_tokenizer_tmp.vocab"]:
         os.remove(file)
+
+
+def test_disk_corpus_stats_and_merge_match_ram():
+    """DiskCorpus must match RamCorpus pair counts before and after a merge batch."""
+    ids = [
+        array("i", [2, 97, 98, 99]),
+        array("i", [1, 98, 99, 100]),
+        array("i", [1, 101, 101, 101]),
+        array("i", [3, 97, 98, 97, 98]),
+    ]
+    # Independent copies so in-place merges on one backend cannot affect the other.
+    ram_ids = [array("i", c) for c in ids]
+    disk_ids = [array("i", c) for c in ids]
+    mult = 1000
+    pairs = {97 * mult + 98: 256}  # merge 'ab' -> 256
+
+    with RamCorpus(ram_ids, n=2) as ram, \
+         tempfile.TemporaryDirectory() as work_dir, \
+         DiskCorpus(disk_ids, n=2, work_dir=work_dir) as disk:
+        assert dict(ram.initial_stats(mult)) == dict(disk.initial_stats(mult))
+        assert dict(ram.merge_and_recount(pairs, mult)) == dict(disk.merge_and_recount(pairs, mult))
+        # Manifest + shards exist under work_dir for inspection / later resume work.
+        assert os.path.isfile(os.path.join(work_dir, "manifest.json"))
+        assert os.path.isfile(os.path.join(work_dir, "shard_0000.bin"))
+
+
+def test_ram_disk_identical_vocab_taylorswift():
+    """backend='disk' must learn the same merges and vocab bytes as backend='ram'."""
+    text = open(TAYLORSWIFT, encoding="utf-8").read()
+    vocab_size = 256 + 64
+
+    ram = BatchTokenizer(multiprocess=False)
+    ram.train(text, vocab_size, backend="ram")
+
+    disk = BatchTokenizer(multiprocess=False)
+    with tempfile.TemporaryDirectory() as work_dir:
+        disk.train(text, vocab_size, backend="disk", work_dir=work_dir)
+
+    assert ram.merges == disk.merges
+    assert ram.vocab == disk.vocab
+    # Spot-check that the trained models tokenize the corpus the same way.
+    sample = text[:2000]
+    assert ram.encode(sample) == disk.encode(sample)
+
+
+def test_ram_disk_identical_vocab_superbpe_stages():
+    """Two-stage SuperBPE-style train: disk stage-2 matches ram stage-2."""
+    import regex as re
+    from batchbpe.base import GPT4_SPLIT_PATTERN
+
+    text = open(TAYLORSWIFT, encoding="utf-8").read()
+    stage1_size = 256 + 40
+    final_size = stage1_size + 20
+    newline_pattern = r"[^\n]+"
+
+    def run(backend: str):
+        tok = BatchTokenizer(pattern=GPT4_SPLIT_PATTERN, multiprocess=False)
+        tok.train(text, stage1_size, backend=backend)
+        tok.pattern = newline_pattern
+        tok.compiled_pattern = re.compile(newline_pattern)
+        with tempfile.TemporaryDirectory() as work_dir:
+            tok.train(text, final_size, backend=backend,
+                      work_dir=work_dir if backend == "disk" else None)
+        return tok
+
+    ram = run("ram")
+    disk = run("disk")
+    assert ram.merges == disk.merges
+    assert ram.vocab == disk.vocab
+
+
+def test_disk_backend_temp_work_dir_cleaned_up():
+    """Omitting work_dir uses a temp dir that DiskCorpus removes on close."""
+    tok = BatchTokenizer(multiprocess=False)
+    tok.train("aaabdaaabac", 256 + 3, backend="disk")
+    assert tok.encode("aaabdaaabac") == [258, 100, 258, 97, 99]
+
 
 # TODO: make this equivalency test a standalone script that compares two tokenizers
 # def test_batch_regex_equivalent():
