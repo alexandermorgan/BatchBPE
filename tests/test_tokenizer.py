@@ -223,8 +223,8 @@ def test_disk_corpus_stats_and_merge_match_ram():
         assert os.path.isfile(os.path.join(work_dir, "shard_000000.bin"))
 
 
-def test_disk_corpus_skips_replace_when_length_unchanged():
-    """If no merges fire, chunk lengths stay the same and the shard file is kept."""
+def test_disk_corpus_skips_write_when_length_unchanged():
+    """If no merges fire, chunk lengths stay the same and the shard bytes are kept."""
     ids = [
         array("i", [1, 97, 98, 99]),
         array("i", [1, 100, 101, 102]),
@@ -241,7 +241,30 @@ def test_disk_corpus_skips_replace_when_length_unchanged():
         assert open(path, "rb").read() == before
         assert os.stat(path).st_mtime_ns == mtime_before
         assert stats[97 * mult + 98] == 1
-        assert not os.path.exists(path + ".tmp")
+
+
+def test_disk_corpus_rewrites_only_shortened_slots():
+    """In-place slot update: a shortened doc must not disturb a neighbor's bytes."""
+    ids = [
+        array("i", [1, 97, 98, 99]),       # 'ab' merges -> shortens
+        array("i", [1, 100, 101, 102]),    # unchanged
+    ]
+    mult = 1000
+    pairs = {97 * mult + 98: 256}
+    with tempfile.TemporaryDirectory() as work_dir, \
+         DiskCorpus([array("i", c) for c in ids], n=1, work_dir=work_dir,
+                    records_per_shard=10) as disk:
+        path = disk._shard_paths[0]
+        before = open(path, "rb").read()
+        # Slot0: capacity=4, used=4, 4 ints; Slot1 starts at 8 + 16 = 24.
+        slot1_off = 8 + 4 * 4
+        neighbor_before = before[slot1_off:]
+        disk.merge_and_recount(pairs, mult)
+        after = open(path, "rb").read()
+        assert len(after) == len(before)  # fixed slot layout; file size unchanged
+        assert after[slot1_off:] == neighbor_before
+        assert _read_shard(path)[0].tolist() == [1, 256, 99]
+        assert _read_shard(path)[1].tolist() == [1, 100, 101, 102]
 
 
 def test_disk_corpus_ten_records_per_shard():

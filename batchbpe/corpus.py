@@ -9,8 +9,8 @@ the work is parallelized:
   - RamCorpus:  the chunk list lives in memory (the typical case).
   - DiskCorpus: sharded on-disk backend for SuperBPE-style continued training on
     datasets too large for RAM and/or open-field merges (e.g. not space-split).
-    Chunks are stored in small shards and processed in parallel with a bounded
-    worker pool.
+    Chunks live in fixed-capacity slots inside small shard files; only shortened
+    docs are rewritten in place. A bounded worker pool processes shards in waves.
 
 Both backends accept `max_stats_size` (from train(memory_efficient=True)): when
 positive, pair-count dicts are kept to that many keys by repeatedly retaining
@@ -26,9 +26,9 @@ per adjacent pair in the hot loop; `mult` must exceed the largest token id so
 that divmod recovers (first, last).
 
 Docs are handled one at a time: merge (if any) then count for that chunk before
-moving on. Disk workers stream shard files the same way so finished chunks can
-be freed; RamCorpus still retains its list for the whole run but uses the same
-per-doc control flow.
+moving on. Disk shards use fixed-capacity slots so a shortened doc is rewritten
+in place without touching its neighbors; RamCorpus still retains its list for
+the whole run but uses the same per-doc control flow.
 """
 from abc import ABC, abstractmethod
 from array import array
@@ -230,37 +230,75 @@ class RamCorpus(Corpus):
 
 
 # -----------------------------------------------------------------------------
-# on-disk shard I/O (length-prefixed array('i') chunks, streamable / appendable)
+# on-disk shard I/O — fixed-capacity slots (shrink-only in-place updates)
+#
+# Each slot is:
+#   uint32 capacity   # max int32 payload elements (fixed at first write)
+#   uint32 used       # current int32 payload elements (shrinks on merge)
+#   int32[capacity]   # payload; only the first `used` elements are live
+#
+# Slot byte size is fixed at create time, so a shortened chunk is rewritten in
+# place without shifting later docs. Slack (capacity - used) is left as padding.
 
 _MANIFEST_NAME = "manifest.json"
 _SHARD_FMT = "shard_{:06d}.bin"
-_SCHEMA_VERSION = 2  # v2: no leading chunk-count; EOF-delimited length-prefixed records
+_SCHEMA_VERSION = 3  # v3: fixed-capacity slots; in-place shrink on merge
 _RECORDS_PER_SHARD = 100  # dataset records (chunks) per on-disk shard file
 
 
-def _append_chunk(f, chunk: array) -> None:
-    """Append one length-prefixed chunk to an open binary file."""
-    f.write(array("I", [len(chunk)]).tobytes() + chunk.tobytes())
+def _append_chunk(f, chunk: array[int]) -> None:
+    """Append one fixed-capacity slot (capacity == used at create)."""
+    n = len(chunk)
+    f.write(array("I", [n, n]).tobytes() + chunk.tobytes())
 
 
 def _write_shard(path: str, chunks: list[array[int]] | tuple[array[int], ...]) -> None:
-    """Write chunks as a stream of (uint32 len, int32*len) records."""
+    """Write chunks as a stream of fixed-capacity slots."""
     with open(path, "wb") as f:
         for chunk in chunks:
             _append_chunk(f, chunk)
 
 
+def _read_slot_at(f) -> tuple[int, int, array[int]] | None:
+    """Read the next slot. Returns (offset, capacity, chunk) or None at EOF.
+
+    Leaves the file position at the start of the following slot. `chunk` holds
+    only the live `used` elements (slack is skipped).
+    """
+    offset = f.tell()
+    hdr = array("I")
+    try:
+        hdr.fromfile(f, 2)
+    except EOFError:
+        return None
+    capacity, used = int(hdr[0]), int(hdr[1])
+    if used > capacity:
+        raise ValueError(f"corrupt slot at {offset}: used={used} > capacity={capacity}")
+    chunk = array("i")
+    chunk.fromfile(f, used)
+    if capacity > used:
+        f.seek((capacity - used) * 4, os.SEEK_CUR)
+    return offset, capacity, chunk
+
+
+def _write_slot_inplace(f, offset: int, capacity: int, chunk: array[int],
+                        resume_at: int) -> None:
+    """Overwrite a slot's used-count + payload; leave slack and later slots alone."""
+    used = len(chunk)
+    if used > capacity:
+        raise ValueError(f"chunk len {used} exceeds slot capacity {capacity}")
+    f.seek(offset)
+    f.write(array("I", [capacity, used]).tobytes() + chunk.tobytes())
+    f.seek(resume_at)
+
+
 def _iter_chunks(f) -> Iterator[array[int]]:
-    """Yield length-prefixed chunks from an open binary file until EOF."""
+    """Yield live chunk payloads from slotted shard file until EOF."""
     while True:
-        ln = array("I")
-        try:
-            ln.fromfile(f, 1)
-        except EOFError:
+        slot = _read_slot_at(f)
+        if slot is None:
             break
-        chunk = array("i")
-        chunk.fromfile(f, ln[0])
-        yield chunk
+        yield slot[2]
 
 
 def _iter_shard(path: str) -> Iterator[array[int]]:
@@ -275,13 +313,14 @@ def _read_shard(path: str) -> list[array[int]]:
 
 
 class DiskCorpus(Corpus):
-    """Sharded on-disk backend: chunks live in work_dir as binary shard files.
+    """Sharded on-disk backend: chunks live in work_dir as slotted binary files.
 
     Each shard holds `records_per_shard` dataset records (default
-    `_RECORDS_PER_SHARD`). A worker pool of size `n` processes shards in waves
-    of at most `n` at a time. Within a shard, each doc is merged (if needed),
-    counted, and written before the next doc is read, so peak token RAM is
-    about one chunk per worker. Build from an in-memory list, or stream with
+    `_RECORDS_PER_SHARD`) in fixed-capacity slots. A worker pool of size `n`
+    processes shards in waves of at most `n` at a time. Within a shard, each
+    doc is merged (if needed) and counted one at a time; only docs that shorten
+    are rewritten in place into their existing slot. Peak token RAM is about
+    one chunk per worker. Build from an in-memory list, or stream with
     `from_chunk_iter` (no full-corpus RAM list).
 
     When `max_stats_size > 0`, pair-count dicts are truncated to that many keys
@@ -388,55 +427,30 @@ class DiskCorpus(Corpus):
 
     def _merge_from_path(self, path: str, pairs: dict[int, int],
                          mult: int) -> defaultdict[int, int]:
-        """Stream one doc at a time: merge and count; write only if something merged.
+        """Stream one doc at a time: merge and count; rewrite only shortened slots.
 
-        Merges only shorten chunks. Unchanged docs are not written. On the first
-        shortened chunk, copy the clean byte prefix from the original shard into
-        a tmp file, then append merged records from there on. If nothing merges,
-        the original file is left untouched (no tmp).
+        Merges only shorten chunks. Unchanged docs are left untouched. Shortened
+        docs are written back into their fixed-capacity slot in place so later
+        docs keep their byte offsets (no shard-wide tmp rewrite).
         """
         cap = self._max_stats_size
         soft_limit = cap * 2 if cap > 0 else 0
         counts = defaultdict[int, int](int)
         pairs_get = pairs.get
-        tmp = path + ".tmp"
-        fout = None
-        try:
-            with open(path, "rb") as fin:
-                while True:
-                    start = fin.tell()
-                    ln = array("I")
-                    try:
-                        ln.fromfile(fin, 1)
-                    except EOFError:
-                        break
-                    chunk = array("i")
-                    chunk.fromfile(fin, ln[0])
-                    n_before = len(chunk)
-                    _merge_chunk(chunk, pairs_get, mult)
-                    _accumulate_chunk_stats(chunk, counts, mult)
-                    if soft_limit and len(counts) > soft_limit:
-                        counts = _bound_stats(counts, cap)
-                    if len(chunk) == n_before:
-                        if fout is not None:
-                            # Already rewriting: emit the unchanged record.
-                            _append_chunk(fout, chunk)
-                        continue
-                    if fout is None:
-                        fout = open(tmp, "wb")
-                        if start:
-                            with open(path, "rb") as prefix:
-                                fout.write(prefix.read(start))
-                    _append_chunk(fout, chunk)
-            if fout is not None:
-                fout.close()
-                fout = None
-                os.replace(tmp, path)
-        finally:
-            if fout is not None:
-                fout.close()
-                if os.path.exists(tmp):
-                    os.unlink(tmp)
+        with open(path, "r+b") as f:
+            while True:
+                slot = _read_slot_at(f)
+                if slot is None:
+                    break
+                offset, capacity, chunk = slot
+                resume_at = f.tell()
+                n_before = len(chunk)
+                _merge_chunk(chunk, pairs_get, mult)
+                _accumulate_chunk_stats(chunk, counts, mult)
+                if soft_limit and len(counts) > soft_limit:
+                    counts = _bound_stats(counts, cap)
+                if len(chunk) != n_before:
+                    _write_slot_inplace(f, offset, capacity, chunk, resume_at)
         return _bound_stats(counts, cap)
 
     def _reduce_paths(self, fn) -> defaultdict[int, int]:
