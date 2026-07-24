@@ -18,7 +18,7 @@ taylor_swift_text = "tests/taylorswift.txt"   # <- a copy of the wikipedia artic
 t0 = time.time()
 name = 'batch'
 tokenizer = BatchTokenizer(store_dict=False)
-tokenizer.train(data=taylor_swift_text, vocab_size=1000, backend='disk', verbose=True)   # the more merges you do, the larger the average batch size will be
+tokenizer.train(data=p1_data, vocab_size=10000, backend='ram', verbose=True)   # the more merges you do, the larger the average batch size will be
 t1 = time.time()
 # write name.model and name.vocab files in the models directory
 prefix = os.path.join("models", name)

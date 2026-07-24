@@ -24,6 +24,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "matplotlib",
 ]
 
 [tool.setuptools]

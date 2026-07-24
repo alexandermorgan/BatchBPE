@@ -4,7 +4,7 @@ import os
 import tempfile
 from array import array
 from batchbpe import BatchTokenizer
-from batchbpe.corpus import DiskCorpus, RamCorpus
+from batchbpe.corpus import DiskCorpus, RamCorpus, _read_shard
 
 # -----------------------------------------------------------------------------
 # common test data
@@ -95,6 +95,37 @@ def test_wikipedia_example(tokenizer_factory, backend):
     assert ids == [258, 100, 258, 97, 99]
     assert tokenizer.decode(tokenizer.encode(text)) == text
 
+
+@pytest.mark.parametrize("backend", ["ram", "disk"])
+def test_wikipedia_memory_efficient(backend):
+    """memory_efficient=True must still learn the Wikipedia BPE merges."""
+    tokenizer = BatchTokenizer(multiprocess=False)
+    text = "aaabdaaabac"
+    with tempfile.TemporaryDirectory() as work_dir:
+        tokenizer.train(text, 256 + 3, backend=backend, memory_efficient=True,
+                        work_dir=work_dir if backend == "disk" else None)
+    assert tokenizer.encode(text) == [258, 100, 258, 97, 99]
+
+
+def test_get_stats_respects_max_stats_size():
+    """Bounded get_stats keeps exact top-k counts and never exceeds max_stats_size."""
+    from batchbpe.corpus import get_stats
+    # Many distinct pairs: (0,1), (1,2), ..., (n-2, n-1)
+    n = 50
+    chunk = array("i", [1, *range(n)])
+    capped = get_stats([chunk], mult=1000, max_stats_size=10)
+    assert len(capped) == 10
+    full = get_stats([chunk], mult=1000)
+    assert len(full) == n - 1
+    # Truncation keeps the true highest counts unchanged.
+    for packed, count in capped.items():
+        assert full[packed] == count
+    # Under the cap, result matches the unbounded path exactly.
+    small = array("i", [3, 1, 2, 1, 2])
+    stats = get_stats([small], mult=1000, max_stats_size=10)
+    assert stats == get_stats([small], mult=1000)
+
+
 @pytest.mark.parametrize("special_tokens", [{}, special_tokens])
 def test_save_load(special_tokens):
     # take a bit more complex piece of text and train the tokenizer, chosen at random
@@ -123,6 +154,51 @@ def test_save_load(special_tokens):
         os.remove(file)
 
 
+def test_open_field_skips_dedup_by_default():
+    """Open-field keeps duplicate docs as separate count-1 chunks unless dedup=True."""
+    docs = ["hello world", "hello world", "other text"]
+    flat = BatchTokenizer(pattern=None, multiprocess=False)
+    ids_flat = flat._import_data(docs)
+    assert len(ids_flat) == 3
+    assert all(c[0] == 1 for c in ids_flat)
+
+    deduped = BatchTokenizer(pattern=None, multiprocess=False, dedup=True)
+    ids_dedup = deduped._import_data(docs)
+    assert len(ids_dedup) == 2
+    counts = sorted(c[0] for c in ids_dedup)
+    assert counts == [1, 2]
+
+
+def test_open_field_ram_disk_parity():
+    """Open-field ram vs streaming disk must learn identical merges/vocab."""
+    docs = [
+        "aaabdaaabac",
+        "the quick brown fox jumps over the lazy dog",
+        "aaabdaaabac",  # duplicate: no-dedup keeps both
+    ]
+    vocab_size = 256 + 32
+    ram = BatchTokenizer(pattern=None, multiprocess=False)
+    ram.train(docs, vocab_size, backend="ram")
+    disk = BatchTokenizer(pattern=None, multiprocess=False)
+    with tempfile.TemporaryDirectory() as work_dir:
+        disk.train(docs, vocab_size, backend="disk", work_dir=work_dir)
+    assert ram.merges == disk.merges
+    assert ram.vocab == disk.vocab
+
+
+def test_import_does_not_fetch_text_that_starts_with_https():
+    """Corpus docs beginning with a URL must be trained as literal text, not fetched."""
+    # Mirrors a FineWeb-style doc that opens with an embedded youtu.be link.
+    doc = "https://youtu.be/6oO1iVIikVo</embed>The Best DUI Lawyers and more text " * 20
+    assert doc.startswith("https://")
+    tok = BatchTokenizer(pattern=None, multiprocess=False)
+    ids = tok._import_data([doc])
+    assert len(ids) == 1
+    # count + utf-8 bytes of the literal doc (no network round-trip)
+    assert ids[0][0] == 1
+    assert bytes(ids[0][i] for i in range(1, len(ids[0]))) == doc.encode("utf-8")
+
+
 def test_disk_corpus_stats_and_merge_match_ram():
     """DiskCorpus must match RamCorpus pair counts before and after a merge batch."""
     ids = [
@@ -139,12 +215,43 @@ def test_disk_corpus_stats_and_merge_match_ram():
 
     with RamCorpus(ram_ids, n=2) as ram, \
          tempfile.TemporaryDirectory() as work_dir, \
-         DiskCorpus(disk_ids, n=2, work_dir=work_dir) as disk:
+         DiskCorpus(disk_ids, n=2, work_dir=work_dir, records_per_shard=10) as disk:
         assert dict(ram.initial_stats(mult)) == dict(disk.initial_stats(mult))
         assert dict(ram.merge_and_recount(pairs, mult)) == dict(disk.merge_and_recount(pairs, mult))
         # Manifest + shards exist under work_dir for inspection / later resume work.
         assert os.path.isfile(os.path.join(work_dir, "manifest.json"))
-        assert os.path.isfile(os.path.join(work_dir, "shard_0000.bin"))
+        assert os.path.isfile(os.path.join(work_dir, "shard_000000.bin"))
+
+
+def test_disk_corpus_skips_replace_when_length_unchanged():
+    """If no merges fire, chunk lengths stay the same and the shard file is kept."""
+    ids = [
+        array("i", [1, 97, 98, 99]),
+        array("i", [1, 100, 101, 102]),
+    ]
+    mult = 1000
+    pairs = {200 * mult + 201: 256}  # not present in either chunk
+    with tempfile.TemporaryDirectory() as work_dir, \
+         DiskCorpus([array("i", c) for c in ids], n=1, work_dir=work_dir,
+                    records_per_shard=10) as disk:
+        path = disk._shard_paths[0]
+        before = open(path, "rb").read()
+        mtime_before = os.stat(path).st_mtime_ns
+        stats = disk.merge_and_recount(pairs, mult)
+        assert open(path, "rb").read() == before
+        assert os.stat(path).st_mtime_ns == mtime_before
+        assert stats[97 * mult + 98] == 1
+        assert not os.path.exists(path + ".tmp")
+
+
+def test_disk_corpus_ten_records_per_shard():
+    """Disk shards default to 100 dataset records each."""
+    ids = [array("i", [1, 97, 98]) for _ in range(250)]
+    with tempfile.TemporaryDirectory() as work_dir, \
+         DiskCorpus(ids, n=2, work_dir=work_dir) as disk:
+        assert len(disk._shard_paths) == 3  # 100 + 100 + 50
+        assert len(_read_shard(disk._shard_paths[0])) == 100
+        assert len(_read_shard(disk._shard_paths[2])) == 50
 
 
 def test_ram_disk_identical_vocab_taylorswift():
@@ -196,7 +303,18 @@ def test_disk_backend_temp_work_dir_cleaned_up():
     """Omitting work_dir uses a temp dir that DiskCorpus removes on close."""
     tok = BatchTokenizer(multiprocess=False)
     tok.train("aaabdaaabac", 256 + 3, backend="disk")
-    assert tok.encode("aaabdaaabac") == [258, 100, 258, 97, 99]
+
+
+def test_empty_corpus_does_not_hang():
+    """disk train() clears list inputs; a second train on the same empty list must error, not spin."""
+    tok = BatchTokenizer(pattern=None, multiprocess=False)
+    docs = ["aaabdaaabac"]
+    with tempfile.TemporaryDirectory() as work_dir:
+        tok.train(docs, 256 + 3, backend="disk", work_dir=work_dir)
+    assert docs == []  # cleared after sharding
+    tok2 = BatchTokenizer(pattern=None, multiprocess=False)
+    with tempfile.TemporaryDirectory() as work_dir, pytest.raises(RuntimeError, match="no safe pairs"):
+        tok2.train(docs, 256 + 8, backend="disk", work_dir=work_dir)
 
 
 # TODO: make this equivalency test a standalone script that compares two tokenizers

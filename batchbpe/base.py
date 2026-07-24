@@ -30,8 +30,13 @@ GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1
 def merge(ids, pair, idx, len_ids):
     """
     In the list of integers (ids), replace all consecutive occurrences
-    of pair with the new integer token idx
+    of pair with the new integer token idx.
     Example: ids=[1, 2, 3, 1, 2], pair=(1, 2), idx=4 -> [4, 3, 4]
+
+    - ids: mutable list of token ids to merge in place.
+    - pair: (left, right) token ids to replace.
+    - idx: new token id that replaces each occurrence of pair.
+    - len_ids: current length of ids (avoids repeated len() calls).
     """
     i = 0
     while i + 1 < len_ids:
@@ -44,6 +49,10 @@ def merge(ids, pair, idx, len_ids):
     return len_ids
 
 def replace_control_characters(s: str) -> str:
+    """Escape Unicode control characters so tokens print safely.
+
+    - s: string that may contain control characters.
+    """
     # we don't want to print control characters
     # which distort the output (e.g. \n or much worse)
     # https://stackoverflow.com/questions/4324790/removing-control-characters-from-a-string-in-python/19016117#19016117
@@ -57,12 +66,20 @@ def replace_control_characters(s: str) -> str:
     return "".join(chars)
 
 def render_token(t: bytes) -> str:
-    # pretty print a token, escaping control characters
+    """Pretty-print a token, escaping control characters.
+
+    - t: raw token bytes.
+    """
     s = t.decode('utf-8', errors='replace')
     s = replace_control_characters(s)
     return s
 
 def _process_string_scalar(batch, pattern):  # for pyarrow.ChunkedArray
+    """Split/count chunks in one parquet/Arrow batch (worker helper).
+
+    - batch: iterable of Arrow string scalars (one text column batch).
+    - pattern: split regex, or None for open-field (whole doc = one chunk).
+    """
     # Compile once per thread via thread-local storage. Sharing a single
     # compiled object across threads segfaults; recompiling every call with
     # cache_pattern=False is too slow for the GPT-4 pattern.
@@ -80,6 +97,22 @@ def _process_string_scalar(batch, pattern):  # for pyarrow.ChunkedArray
         counter.update(_tls.compiled.findall(item.as_py()))
     return counter, time.monotonic() - t0
 
+
+def _looks_like_url(s: str) -> bool:
+    """True only for short, single-line http(s) references meant to be fetched.
+
+    Training documents often *begin* with a URL (or embed one in a larger
+    string). Those must be treated as literal text, not downloaded — otherwise
+    two train() calls can see different network responses and diverge.
+
+    - s: candidate string to test.
+    """
+    if not (s.startswith("https://") or s.startswith("http://")):
+        return False
+    if len(s) > 512 or any(c in s for c in "\n\r\t "):
+        return False
+    return True
+
 # -----------------------------------------------------------------------------
 # the base Tokenizer class
 
@@ -88,7 +121,16 @@ class Tokenizer:
     Base class for Tokenizers containing common supporting functionality,
     but not any actual tokenization logic.
     """
-    def __init__(self, pattern=GPT4_SPLIT_PATTERN, multiprocess=True, store_dict=False, stop_list_size=0, freq_cutoff=1):
+    def __init__(self, pattern=GPT4_SPLIT_PATTERN, multiprocess=True, store_dict=False,
+                 stop_list_size=0, freq_cutoff=1, dedup: bool | None = None):
+        """
+        - pattern: split regex. Default GPT-4; None = open-field (whole doc = one chunk).
+        - multiprocess: use multiple CPU cores when importing data.
+        - store_dict: save the chunk Counter to a CSV after import (requires dedup).
+        - stop_list_size: promote this many frequent multi-char chunks to vocab early.
+        - freq_cutoff: drop chunks seen fewer times than this (1 = keep all with count >= 1).
+        - dedup: Counter-dedup chunks on import. None = auto (True with a pattern, False open-field).
+        """
         # default: vocab size of 256 (all bytes), no merges, no patterns
         self.merges = {} # (int, int) -> int
         self.special_tokens = {} # str -> int, e.g. {'<|endoftext|>': 100257}
@@ -104,18 +146,32 @@ class Tokenizer:
         self.stop_list_size = stop_list_size
         self.stop_words = {}
         self.freq_cutoff = freq_cutoff
+        self._set_dedup(dedup)
+
+    def _set_dedup(self, dedup: bool | None = None) -> None:
+        """Set whether to Counter-dedup chunks during import.
+
+        None (default) means automatic: True when a split pattern is set, False
+        for open-field (pattern=None), where full-document duplicates are rare.
+
+        - dedup: True/False to force, or None for automatic.
+        """
+        self.dedup = self.pattern is not None if dedup is None else dedup
 
     def _id_dict_to_list(self, ids, *, encode_with_vocab: bool = False):
         """
         Given a dictionary of token counts, return a list of lists where
         each list contains the count as the FIRST element followed by tokens.
-        Stop words are separated if the user has set the stop_list_size class 
+        Stop words are separated if the user has set the stop_list_size class
         attribute to a positive integer.
 
         Fresh BPE (encode_with_vocab=False): each chunk becomes raw UTF-8 bytes.
         New split wave with an existing vocabulary (encode_with_vocab=True): each
         chunk is encoded with the current merges first, so pair counts reflect
         the stage-1 token ids rather than relearned byte pairs.
+
+        - ids: Counter of chunk string -> count.
+        - encode_with_vocab: encode chunks with current merges instead of raw bytes.
         """
         result = []
         str_encode = str.encode
@@ -149,12 +205,114 @@ class Tokenizer:
             ]
         return result
 
-    def _import_data(self, data, *, encode_with_vocab: bool = False) -> list[tuple[bytes, int]]:
+    def _iter_chunk_texts(self, data):
+        """Yield raw chunk strings without aggregating counts (no Counter dedup).
+
+        Open-field: one yield per document. With a split pattern: one yield per
+        regex match. CSV / pre-baked dicts yield each key once per unit count
+        (a count of 3 yields the key three times) so pair totals stay correct.
+
+        - data: text, path(s), URL(s), dict(s), or list thereof.
+        """
+        if not isinstance(data, (list, tuple)):
+            data = (data,)
+        for item in data:
+            if isinstance(item, str) and item.endswith('.csv'):
+                with open(item, 'r') as f:
+                    reader = csv.reader(f)
+                    next(reader)  # skip headers
+                    for k, v in reader:
+                        for _ in range(int(v)):
+                            yield k
+                continue
+            if isinstance(item, str):
+                if _looks_like_url(item):
+                    item = requests.get(item).text
+                elif os.path.isfile(item):
+                    if item.endswith('.txt'):
+                        with open(item, 'r', encoding='utf-8') as f:
+                            if self.compiled_pattern is None:
+                                yield f.read()
+                            else:
+                                for line in f:
+                                    yield from (m.group() for m in re.finditer(self.compiled_pattern, line))
+                        continue
+                    if item.endswith('.parquet'):
+                        pf = parquet.ParquetFile(item)
+                        total_rows = pf.metadata.num_rows
+                        row_batch_size = max(1, total_rows // (self._cpus * 40))
+                        rows_done = 0
+                        for rb in pf.iter_batches(columns=['text'], batch_size=row_batch_size):
+                            col = rb.column('text')
+                            for i in range(len(col)):
+                                text = col[i].as_py()
+                                if self.compiled_pattern is None:
+                                    yield text
+                                else:
+                                    yield from self.compiled_pattern.findall(text)
+                            rows_done += len(col)
+                            print(f"  parquet {rows_done:,}/{total_rows:,} rows"
+                                  f"  (streaming, no dedup)", flush=True)
+                        continue
+            if isinstance(item, dict):
+                d = dict(item)
+                last_key = next(reversed(d))
+                last_val = d[last_key]
+                if last_val == 0 and last_key == self.pattern:
+                    del d[last_key]
+                elif last_val == 0:
+                    print(f'Warning: the dictionary or csv file passed did not use the same split pattern.')
+                    del d[last_key]
+                for k, v in d.items():
+                    for _ in range(int(v)):
+                        yield k
+            elif isinstance(item, str):
+                if self.compiled_pattern is None:
+                    yield item
+                else:
+                    yield from (m.group() for m in re.finditer(self.compiled_pattern, item))
+            elif isinstance(item, ChunkedArray):
+                for i in range(len(item)):
+                    text = item[i].as_py()
+                    if self.compiled_pattern is None:
+                        yield text
+                    else:
+                        yield from self.compiled_pattern.findall(text)
+            elif item is not None:
+                print(f'Warning: unrecognised data type {type(item)}, skipping.')
+
+    def _iter_chunk_arrays(self, data, *, encode_with_vocab: bool = False):
+        """Yield `array('i', [1, *tokens])` for each chunk text (no dedup).
+
+        - data: text, path(s), URL(s), dict(s), or list thereof.
+        - encode_with_vocab: encode chunks with current merges instead of raw bytes.
+        """
+        if self.stop_list_size:
+            raise ValueError("stop_list_size requires dedup=True")
+        str_encode = str.encode
+        encode = self._encode_chunk_core if encode_with_vocab else (lambda k: str_encode(k, 'utf-8'))
+        for text in self._iter_chunk_texts(data):
+            if 1 < self.freq_cutoff > 1:
+                continue  # count is always 1; freq_cutoff>1 drops everything
+            yield array('i', [1, *encode(text)])
+
+    def _import_data(self, data, *, encode_with_vocab: bool = False) -> list:
         """
         Determine if `data` is a text as a string, a path to a file, a url to
         a text document, a dictionary of datasets kwargs, or a list of any of
-        the above. Return a list of 2-tuples of bytes objects and their counts.
+        the above. Return a list of chunk arrays `[count, *token_ids]`.
+
+        When self.dedup is false (the default for open-field), chunks are not
+        aggregated in a Counter — each document/match becomes its own row.
+
+        - data: text, path(s), URL(s), dict(s), or list thereof.
+        - encode_with_vocab: encode chunks with current merges instead of raw bytes.
         """
+        if not self.dedup:
+            if self.store_dict:
+                print('Warning: store_dict requires dedup=True; ignoring store_dict.')
+            return list(self._iter_chunk_arrays(data, encode_with_vocab=encode_with_vocab))
+
         ids = Counter()
         if not isinstance(data, (list, tuple)):
             data = (data,)
@@ -168,8 +326,8 @@ class Tokenizer:
                         ids[k] += int(v)
                     item = None  # skip the post-loop dict handling block
             elif isinstance(item, str):
-                if item.startswith('https://') or item.startswith('http://'):
-                    item = requests.get(item).text    # if it's a url, assume it's to a text file
+                if _looks_like_url(item):
+                    item = requests.get(item).text    # short URL path → fetch remote text
                 elif os.path.isfile(item):
                     if item.endswith('.txt'):
                         with open(item, 'r', encoding='utf-8') as f:
@@ -262,7 +420,12 @@ class Tokenizer:
         return ids
 
     def train(self, text, vocab_size, verbose=False):
-        # Tokenizer can train a vocabulary of size vocab_size from text
+        """Train a vocabulary from text. Subclasses must implement this.
+
+        - text: training corpus.
+        - vocab_size: target vocabulary size.
+        - verbose: print training progress.
+        """
         raise NotImplementedError
 
     def _build_vocab(self):
@@ -275,8 +438,10 @@ class Tokenizer:
         return vocab
 
     def register_special_tokens(self, special_tokens):
-        # special_tokens is a dictionary of str -> int
-        # example: {"<|endoftext|>": 100257}
+        """Register special tokens for encode/decode.
+
+        - special_tokens: str -> int map, e.g. {"<|endoftext|>": 100257}.
+        """
         self.special_tokens = special_tokens
         self.inverse_special_tokens = {v: k for k, v in special_tokens.items()}
 
@@ -286,6 +451,8 @@ class Tokenizer:
         This is inspired (but not equivalent to!) sentencepiece's model saving:
         - model file is the critical one, intended for load()
         - vocab file is just a pretty printed version for human inspection only
+
+        - file_prefix: path prefix for the .model and .vocab files.
         """
         # write the model: to be used in load() later
         model_file = file_prefix + ".model"
@@ -328,7 +495,10 @@ class Tokenizer:
                     f.write(f"[{s}] {idx}\n")
 
     def load(self, model_file):
-        """Inverse of save() but only for the model file"""
+        """Inverse of save() but only for the model file.
+
+        - model_file: path to a .model file previously written by save().
+        """
         assert model_file.endswith(".model")
         # read the model file
         merges = {}
@@ -356,7 +526,10 @@ class Tokenizer:
         self.compiled_pattern = re.compile(self.pattern) if self.pattern is not None else None
 
     def decode(self, ids):
-        # given ids (list of integers), return Python string
+        """Decode token ids back to a Python string.
+
+        - ids: list of integer token ids.
+        """
         part_bytes = [self.vocab[idx] if idx in self.vocab
             else self.inverse_special_tokens[idx].encode("utf-8")
             for idx in ids] # raises KeyError if any idx is not a valid token
@@ -369,6 +542,8 @@ class Tokenizer:
         Given a chunk of text, return a list of integers representing the tokens.
         Uncached so it is safe to call during training (while self.merges is
         still growing between stages) without polluting the inference cache.
+
+        - chunk: one text chunk (already split by the pattern, if any).
         """
         if chunk in self.stop_words:   # TODO: revisit this if statement
             return [self.stop_words[chunk]]
@@ -394,11 +569,17 @@ class Tokenizer:
 
     @lru_cache(maxsize=131072)
     def _encode_chunk(self, chunk):
-        """Cached wrapper around _encode_chunk_core, used by encode()."""
+        """Cached wrapper around _encode_chunk_core, used by encode().
+
+        - chunk: one text chunk (already split by the pattern, if any).
+        """
         return self._encode_chunk_core(chunk)
 
     def encode_ordinary(self, text):
-        """Encoding that ignores any special tokens."""
+        """Encoding that ignores any special tokens.
+
+        - text: string to encode.
+        """
         if self.compiled_pattern is None:   # open-field: no splitting
             return self._encode_chunk(text)
         ids = []
@@ -409,10 +590,12 @@ class Tokenizer:
     def encode(self, text, allowed_special="none_raise"):
         """
         Unlike encode_ordinary, this function handles special tokens.
-        allowed_special: can be "all"|"none"|"none_raise" or a custom set of special tokens
-        if none_raise, then an error is raised if any special token is encountered in text
         this is the default tiktoken behavior right now as well
         any other behavior is either annoying, or a major footgun
+
+        - text: string to encode.
+        - allowed_special: "all" | "none" | "none_raise" | set of special token strings.
+          "none_raise" errors if any special token appears in text.
         """
         # decode the user desire w.r.t. handling of special tokens
         special = None
