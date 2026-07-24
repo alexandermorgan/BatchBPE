@@ -56,9 +56,16 @@ class MemSeries:
 class RunReport:
     """Lightweight leftovers from a finished train run (no tokenizer)."""
     run: TrainRun
+    elapsed: float
     done_line: str
     rss_line: str
     mem: MemSeries
+
+
+def series_label(report: RunReport) -> str:
+    """Legend label: ``disk_ME=True_45`` (backend, memory_efficient, whole seconds)."""
+    return (f"{report.run.backend}_ME={report.run.memory_efficient}_"
+            f"{round(report.elapsed)}")
 
 
 def resolve_pattern(value: str | None) -> str | None:
@@ -130,7 +137,7 @@ class RssMonitor:
         return self._total / self._n if self._n else 0.0
 
 
-def plot_memory_chart(reports: list[RunReport], path: str) -> None:
+def plot_memory_chart(reports: list[RunReport], path: str, n_docs: int) -> None:
     """Plot RSS vs normalized progress (0–100% of each run) for all runs."""
     import matplotlib.pyplot as plt
 
@@ -143,11 +150,11 @@ def plot_memory_chart(reports: list[RunReport], path: str) -> None:
         rss_mb = [r / (1024 ** 2) for _, r in mem.samples]
         t_max = times[-1] if times[-1] > 0 else 1.0
         progress = [100.0 * t / t_max for t in times]
-        ax.plot(progress, rss_mb, label=report.run.name, linewidth=1.5)
+        ax.plot(progress, rss_mb, label=series_label(report), linewidth=1.5)
 
     ax.set_xlabel("Progress (% of run)")
     ax.set_ylabel("RSS (MB)")
-    ax.set_title("Memory consumption over training")
+    ax.set_title(f"Memory consumption over training ({n_docs} docs)")
     ax.set_xlim(0, 100)
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -232,7 +239,8 @@ def run_isolated(
                 f"avg≈{fmt_bytes(result['average'])}")
     mem = MemSeries(peak=result["peak"], average=result["average"],
                     samples=result["samples"])
-    return RunReport(run=run, done_line=done_line, rss_line=rss_line, mem=mem)
+    return RunReport(run=run, elapsed=result["elapsed"], done_line=done_line,
+                     rss_line=rss_line, mem=mem)
 
 
 def print_run_settings(run: TrainRun, vocab_size: int, pattern: str | None,
@@ -358,7 +366,7 @@ def main() -> None:
               f"avg≈{fmt_bytes(report.mem.average)}")
 
     if args.plot:
-        plot_memory_chart(reports, args.plot)
+        plot_memory_chart(reports, args.plot, args.docs)
 
     # if merges_ok and vocab_ok:
     #     print(f"\nPASS: {run_b.name} matches {run_a.name} on first "
