@@ -64,8 +64,7 @@ class RunReport:
 
 def series_label(report: RunReport) -> str:
     """Legend label: ``disk_ME=True_45`` (backend, memory_efficient, whole seconds)."""
-    return (f"{report.run.backend}_ME={report.run.memory_efficient}_"
-            f"{round(report.elapsed)}")
+    return f"{report.run.backend}_ME={report.run.memory_efficient}_{round(report.elapsed)}s"
 
 
 def resolve_pattern(value: str | None) -> str | None:
