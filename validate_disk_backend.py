@@ -359,11 +359,6 @@ def main() -> None:
     # print(f"vocab identical:         {vocab_ok}")
     # print(f"encode sample identical: {encode_ok}")
 
-    print("\n=== MEMORY ===")
-    for report in reports:
-        print(f"{report.run.name:20s} peak={fmt_bytes(report.mem.peak)}  "
-              f"avg≈{fmt_bytes(report.mem.average)}")
-
     if args.plot:
         plot_memory_chart(reports, args.plot, args.docs)
 
