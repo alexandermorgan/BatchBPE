@@ -7,6 +7,7 @@ QuickTokenizer subclasses of this Tokenizer class.
 import unicodedata
 from array import array
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import batched, islice
 from functools import lru_cache
@@ -74,10 +75,10 @@ def render_token(t: bytes) -> str:
     s = replace_control_characters(s)
     return s
 
-def _process_string_scalar(batch, pattern):  # for pyarrow.ChunkedArray
-    """Split/count chunks in one parquet/Arrow batch (worker helper).
+def _process_text_batch(batch, pattern):
+    """Split/count a batch of Python strings (worker helper).
 
-    - batch: iterable of Arrow string scalars (one text column batch).
+    - batch: iterable of strings.
     - pattern: split regex, or None for open-field (whole doc = one chunk).
     """
     # Compile once per thread via thread-local storage. Sharing a single
@@ -87,15 +88,19 @@ def _process_string_scalar(batch, pattern):  # for pyarrow.ChunkedArray
     t0 = time.monotonic()
     counter = Counter()
     if pattern is None:   # open-field: each document is a single chunk
-        for item in batch:
-            counter[item.as_py()] += 1
+        counter.update(batch)
         return counter, time.monotonic() - t0
     if getattr(_tls, 'pattern', None) != pattern:
         _tls.pattern = pattern
         _tls.compiled = re.compile(pattern)
-    for item in batch:
-        counter.update(_tls.compiled.findall(item.as_py()))
+    for text in batch:
+        counter.update(_tls.compiled.findall(text))
     return counter, time.monotonic() - t0
+
+
+def _process_string_scalar(batch, pattern):  # for pyarrow.ChunkedArray
+    """Split/count an Arrow string batch (worker helper)."""
+    return _process_text_batch((item.as_py() for item in batch), pattern)
 
 
 def _looks_like_url(s: str) -> bool:
@@ -211,8 +216,10 @@ class Tokenizer:
         Open-field: one yield per document. With a split pattern: one yield per
         regex match. CSV / pre-baked dicts yield each key once per unit count
         (a count of 3 yields the key three times) so pair totals stay correct.
+        Generic iterables can yield strings, Hugging Face-style records with a
+        ``text`` field, or batched records whose ``text`` field is iterable.
 
-        - data: text, path(s), URL(s), dict(s), or list thereof.
+        - data: text, path(s), URL(s), dict(s), or list/iterator thereof.
         """
         if not isinstance(data, (list, tuple)):
             data = (data,)
@@ -278,6 +285,21 @@ class Tokenizer:
                         yield text
                     else:
                         yield from self.compiled_pattern.findall(text)
+            elif isinstance(item, Iterable):
+                for record in item:
+                    texts = record['text'] if isinstance(record, Mapping) else record
+                    if isinstance(texts, str):
+                        texts = (texts,)
+                    for text in texts:
+                        if not isinstance(text, str):
+                            raise TypeError(
+                                'stream records must be strings or mappings with '
+                                "a string or iterable 'text' field"
+                            )
+                        if self.compiled_pattern is None:
+                            yield text
+                        else:
+                            yield from (m.group() for m in self.compiled_pattern.finditer(text))
             elif item is not None:
                 print(f'Warning: unrecognised data type {type(item)}, skipping.')
 
@@ -396,6 +418,43 @@ class Tokenizer:
                         [self.pattern] * len(batches),
                     ):
                         ids.update(counter)
+            elif isinstance(item, Iterable):
+                # Consume generic streams (for example datasets.IterableDataset)
+                # incrementally. The master Counter is the only full-corpus
+                # structure; workers receive and return just small text batches.
+                def iter_texts():
+                    for record in item:
+                        texts = record['text'] if isinstance(record, Mapping) else record
+                        if isinstance(texts, str):
+                            yield texts
+                            continue
+                        for text in texts:
+                            if not isinstance(text, str):
+                                raise TypeError(
+                                    'stream records must be strings or mappings with '
+                                    "a string or iterable 'text' field"
+                                )
+                            yield text
+
+                text_batches = batched(iter_texts(), 32)
+                if self._cpus == 1:
+                    for batch in text_batches:
+                        counter, _ = _process_text_batch(batch, self.pattern)
+                        ids.update(counter)
+                else:
+                    futures = {}
+                    with ProcessPoolExecutor(max_workers=self._cpus) as pool:
+                        for batch in islice(text_batches, self._cpus):
+                            future = pool.submit(_process_text_batch, batch, self.pattern)
+                            futures[future] = None
+                        for batch in text_batches:
+                            done = next(as_completed(futures))
+                            ids.update(done.result()[0])
+                            del futures[done]
+                            future = pool.submit(_process_text_batch, batch, self.pattern)
+                            futures[future] = None
+                        for done in as_completed(futures):
+                            ids.update(done.result()[0])
             elif item is not None:
                 print(f'Warning: unrecognised data type {type(item)}, skipping.')
 

@@ -110,18 +110,39 @@ data = load_dataset(**kwargs).data['text']
 tokenizer.train(data, 50304, verbose=True)
 ```
 
-It is also possible to pass a `datasets.IterableDataset` though this is currently not recommended because it is very slow for large datasets. I think I must be processing it poorly so I hope to improve this. Here is the example:
+It is also possible to stream records from a Hugging Face dataset without retaining the source texts in memory. With `dedup=True`, BatchBPE processes small input batches and aggregates their split chunks into one in-memory count dictionary before training. For example, to stream the first 800 records from FineWeb-Edu's 10B-token sample:
 
-```python
-from batchbpe import BatchTokenizer
-tokenizer = BatchTokenizer()
-path = 'full_path_to_parquet_file'
-kwargs = {'path': 'melikocki/preprocessed_shakespeare', 'split': 'train', 'streaming': True}
-data = load_dataset(**kwargs)
-tokenizer.train(data, 50304, verbose=True)
+```bash
+# Optional for higher Hugging Face Hub rate limits.
+uv run hf auth login
 ```
 
-Instead of streaming datasets, if you want to load datasets that don't fit in memory and/or hard-disk space, I recommend downloading as many of the files of the dataset at a time as possible, then converting those to BatchBPE's csv representation of a dataset which is a greater than 100X compression for large datasets, and then deleting the dataset files. Do this for as many groups of files as necessary, then load a list of the csv files BatchBPE produced to combine those. For example, the 10B token sample of the FineWeb-Edu dataset is about 27GB spread out among 10 files. Say you only have room for 5 of those files at a time on your computer, you could load the entire dataset in the following way. While this requires a bit more setup, subsequent uses of the csv file will be very fast, so you only have to do it once.
+Then run the script:
+
+```python
+from itertools import islice
+
+from datasets import load_dataset
+from batchbpe import BatchTokenizer
+
+stream = load_dataset(
+    'HuggingFaceFW/fineweb-edu',
+    name='sample-10BT',
+    split='train',
+    streaming=True,
+)
+tokenizer = BatchTokenizer(dedup=True)
+tokenizer.train(
+    islice(stream, 800),
+    50304,
+    backend='ram',
+    verbose=True,
+)
+```
+
+The resulting count dictionary and tokenized corpus must fit in RAM. If they do not, use `backend='disk', dedup=False`; it writes tokenized chunks to disk as they arrive, at the cost of slower training. Or you can process less data so that it will fit in RAM.
+
+Instead of streaming datasets, if you want to load datasets that don't fit in memory and/or hard-disk space, you can download as many of the files of the dataset at a time as possible, then convert those to BatchBPE's csv representation of a dataset which is a greater than 100X compression for large datasets, and then deleting the dataset files. Do this for as many groups of files as necessary, then load a list of the csv files BatchBPE produced to combine those. For example, the 10B token sample of the FineWeb-Edu dataset is about 27GB spread out among 10 files. Say you only have room for 5 of those files at a time on your computer, you could load the entire dataset in the following way. While this requires a bit more setup, subsequent uses of the csv file will be very fast, so you only have to do it once.
 
 ```python
 # download 5 files from the dataset before beginning

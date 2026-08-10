@@ -19,6 +19,7 @@ dependencies = [
     "psutil",
     "numpy>=2.0.2",
     "pytest>=8.4.2",
+    "datasets>=5.0.1",
 ]
 
 [project.optional-dependencies]

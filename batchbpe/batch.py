@@ -25,20 +25,24 @@ class BatchTokenizer(Tokenizer):
         self._corpus_ids = None
         self._corpus_pattern = None
 
-    def train(self, data: str | list[str], vocab_size: int, cap_divisor: int = 2,
+    def train(self, data, vocab_size: int, cap_divisor: int = 2,
               max_batch_size: int = 0, backend: str = "ram", work_dir: str | None = None,
-              memory_efficient: bool = False, verbose: bool = False) -> None:
+              memory_efficient: bool = False, verbose: bool = False,
+              records_per_shard: int | None = None) -> None:
         """
         Trains the tokenizer on the given data to the specified vocab_size. You
         probably don't want to change the cap_divisor or max_batch_size defaults.
 
-        - data: text, path(s), URL(s), or list thereof to train on.
+        - data: text, path(s), URL(s), list thereof, or a stream of text records.
         - vocab_size: target vocabulary size (including the initial 256 bytes).
         - cap_divisor: divides remaining merges to size each batch (default 2).
         - max_batch_size: hard cap on merges per batch; 0 = no cap beyond remaining.
         - backend: "ram" (in-memory) or "disk" (sharded corpus for large data).
         - work_dir: working directory for the "disk" backend; temp dir if omitted.
         - memory_efficient: cap pair-count dicts near vocab_size (less RAM, may differ slightly).
+        - records_per_shard: disk-backend chunk buffer size; lower values use less
+          import RAM but create more shard files. Required for bounded streaming
+          input: use backend="disk" and dedup=False.
         - verbose: print per-batch timing during the merge loop.
 
         Calling train() again with the same split pattern and backend="ram"
@@ -52,6 +56,8 @@ class BatchTokenizer(Tokenizer):
         """
         if backend not in ("ram", "disk"):
             raise ValueError(f"backend must be 'ram' or 'disk', got {backend!r}")
+        if records_per_shard is not None and records_per_shard < 1:
+            raise ValueError("records_per_shard must be at least 1")
 
         encode_with_vocab = bool(self.merges)
         max_stats_size = vocab_size*5 if memory_efficient else 0
@@ -73,9 +79,12 @@ class BatchTokenizer(Tokenizer):
             else:
                 # Stream chunks straight to shards — never build a full Counter
                 # or in-RAM list of arrays.
+                corpus_kwargs = {"max_stats_size": max_stats_size}
+                if records_per_shard is not None:
+                    corpus_kwargs["records_per_shard"] = records_per_shard
                 corpus = DiskCorpus.from_chunk_iter(
                     self._iter_chunk_arrays(data, encode_with_vocab=encode_with_vocab),
-                    self._cpus, work_dir, max_stats_size=max_stats_size)
+                    self._cpus, work_dir, **corpus_kwargs)
                 if isinstance(data, list):
                     data.clear()  # free source strings before the merge loop
                 t1 = time.time()

@@ -186,6 +186,53 @@ def test_open_field_ram_disk_parity():
     assert ram.vocab == disk.vocab
 
 
+def test_disk_backend_accepts_text_record_streams():
+    """Disk import consumes Hugging Face-style records without a source list."""
+    docs = [
+        "aaabdaaabac",
+        "the quick brown fox jumps over the lazy dog",
+        "aaabdaaabac",
+    ]
+
+    def records():
+        yield {"text": docs[0]}
+        yield {"text": docs[1:]}  # Hugging Face batched iterable output
+
+    vocab_size = 256 + 32
+    ram = BatchTokenizer(pattern=None, multiprocess=False)
+    ram.train(docs, vocab_size, backend="ram")
+    disk = BatchTokenizer(pattern=None, multiprocess=False, dedup=False)
+    with tempfile.TemporaryDirectory() as work_dir:
+        disk.train(records(), vocab_size, backend="disk", work_dir=work_dir,
+                   records_per_shard=1)
+    assert disk.merges == ram.merges
+    assert disk.vocab == ram.vocab
+
+
+def test_ram_backend_deduplicates_text_record_streams():
+    """RAM import keeps one weighted chunk per duplicate streamed document."""
+    docs = [
+        "aaabdaaabac",
+        "the quick brown fox jumps over the lazy dog",
+        "aaabdaaabac",
+    ]
+
+    def records():
+        yield {"text": docs[:2]}  # Hugging Face batched iterable output
+        yield {"text": docs[2]}
+
+    vocab_size = 256 + 32
+    expected = BatchTokenizer(pattern=None, multiprocess=False, dedup=True)
+    expected.train(docs, vocab_size, backend="ram")
+    streamed = BatchTokenizer(pattern=None, multiprocess=False, dedup=True)
+    streamed.train(records(), vocab_size, backend="ram")
+
+    assert len(streamed._corpus_ids) == 2
+    assert sorted(chunk[0] for chunk in streamed._corpus_ids) == [1, 2]
+    assert streamed.merges == expected.merges
+    assert streamed.vocab == expected.vocab
+
+
 def test_import_does_not_fetch_text_that_starts_with_https():
     """Corpus docs beginning with a URL must be trained as literal text, not fetched."""
     # Mirrors a FineWeb-style doc that opens with an embedded youtu.be link.

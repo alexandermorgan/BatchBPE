@@ -10,7 +10,8 @@ the work is parallelized:
   - DiskCorpus: sharded on-disk backend for SuperBPE-style continued training on
     datasets too large for RAM and/or open-field merges (e.g. not space-split).
     Chunks live in fixed-capacity slots inside small shard files; only shortened
-    docs are rewritten in place. A bounded worker pool processes shards in waves.
+    docs are rewritten in place. A bounded worker pool keeps shards in flight
+    with work-stealing; count-dicts are still tree-combined in worker-sized batches.
 
 Both backends accept `max_stats_size` (from train(memory_efficient=True)): when
 positive, pair-count dicts are kept to that many keys by repeatedly retaining
@@ -34,7 +35,7 @@ from abc import ABC, abstractmethod
 from array import array
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from heapq import nlargest
 from itertools import batched
 import json
@@ -66,19 +67,24 @@ def _merge_two(a: defaultdict[int, int], b: defaultdict[int, int]) -> defaultdic
     return a
 
 
-def _combine_counts(parts: list[defaultdict[int, int]], pool: ThreadPoolExecutor,
+def _combine_counts(parts: list[defaultdict[int, int]], pool: ThreadPoolExecutor | None,
                     capacity: int = 0) -> defaultdict[int, int]:
     """Sum a list of packed-int count dicts into one (the global pair stats).
 
-    Reduced as a balanced binary tree: each wave merges disjoint pairs of dicts
-    concurrently on `pool`, halving the count per wave, so the merge depth is
-    ceil(log2(len(parts))) waves (e.g. 8 shards -> 3, 16 -> 4, 32 -> 5) instead
-    of len(parts)-1 serial merges. When `capacity > 0`, each merge result is
+    Reduced as a balanced binary tree: each wave merges disjoint pairs of dicts,
+    halving the count per wave, so the merge depth is ceil(log2(len(parts)))
+    waves (e.g. 8 shards -> 3, 16 -> 4, 32 -> 5) instead of len(parts)-1 serial
+    merges. When `pool` is set, each wave runs concurrently on it; when `pool`
+    is None, merges run on the caller thread (avoids competing with in-flight
+    shard work on the same executor). When `capacity > 0`, each merge result is
     truncated to that many keys so intermediates never grow with corpus size.
     """
     while len(parts) > 1:
         pairs = [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)]
-        merged = list[defaultdict[int, int]](pool.map(lambda ab: _merge_two(*ab), pairs))
+        if pool is None:
+            merged = [_merge_two(a, b) for a, b in pairs]
+        else:
+            merged = list[defaultdict[int, int]](pool.map(lambda ab: _merge_two(*ab), pairs))
         if capacity > 0:
             merged = [_bound_stats(m, capacity) for m in merged]
         if len(parts) % 2:   # odd one out carries forward to the next wave
@@ -317,11 +323,13 @@ class DiskCorpus(Corpus):
 
     Each shard holds `records_per_shard` dataset records (default
     `_RECORDS_PER_SHARD`) in fixed-capacity slots. A worker pool of size `n`
-    processes shards in waves of at most `n` at a time. Within a shard, each
-    doc is merged (if needed) and counted one at a time; only docs that shorten
-    are rewritten in place into their existing slot. Peak token RAM is about
-    one chunk per worker. Build from an in-memory list, or stream with
-    `from_chunk_iter` (no full-corpus RAM list).
+    keeps up to `n` shard tasks in flight (a free worker takes the next shard
+    immediately). Completed shard count-dicts are tree-combined in batches of
+    `n` — same combine shape as a wave barrier, without idle gaps. Within a
+    shard, each doc is merged (if needed) and counted one at a time; only docs
+    that shorten are rewritten in place. Peak token RAM is about one chunk per
+    worker. Build from an in-memory list, or stream with `from_chunk_iter`
+    (no full-corpus RAM list).
 
     When `max_stats_size > 0`, pair-count dicts are truncated to that many keys
     throughout recount/combine (see _bound_stats).
@@ -454,25 +462,56 @@ class DiskCorpus(Corpus):
         return _bound_stats(counts, cap)
 
     def _reduce_paths(self, fn) -> defaultdict[int, int]:
-        """Apply `fn(path)` over shards in waves of at most `n_workers`.
+        """Run `fn` on every shard with work-stealing; combine in waves of `n`.
 
-        Folds each wave into a running total. When `max_stats_size > 0`, the
-        running total is truncated after every wave so peak stats RAM stays
-        O(max_stats_size) as the number of shards grows.
+        Up to `n_workers` shard tasks stay in flight: when one finishes, the
+        next pending shard is submitted immediately (no barrier). Completed
+        count-dicts are buffered and tree-combined in batches of `n_workers`
+        via `_combine_counts` — same combine cardinality as the old wave
+        scheduler — then folded into a running total. Batch combines run on
+        the caller thread so they do not contend with in-flight shard tasks on
+        the pool. When `max_stats_size > 0`, each combine/fold truncates so
+        peak stats RAM stays O(max_stats_size).
         """
         paths = self._shard_paths
         if not paths:
             return defaultdict[int, int](int)
         n = self._n_workers
         cap = self._max_stats_size
+        path_iter = iter(paths)
+        in_flight: set = set()
+
+        def _fill() -> None:
+            while len(in_flight) < n:
+                try:
+                    path = next(path_iter)
+                except StopIteration:
+                    break
+                in_flight.add(self._pool.submit(fn, path))
+
+        def _fold_batch(batch: list[defaultdict[int, int]],
+                        total: defaultdict[int, int] | None) -> defaultdict[int, int]:
+            # pool=None: combine on this thread so shard workers keep stealing.
+            wave_total = (_combine_counts(batch, None, cap)
+                          if len(batch) > 1 else _bound_stats(batch[0], cap))
+            return (wave_total if total is None
+                    else _bound_stats(_merge_two(total, wave_total), cap))
+
+        _fill()
+        buffer: list[defaultdict[int, int]] = []
         total: defaultdict[int, int] | None = None
-        for i in range(0, len(paths), n):
-            wave = paths[i:i + n]
-            parts = list(self._pool.map(fn, wave))
-            wave_total = (_combine_counts(parts, self._pool, cap)
-                          if len(parts) > 1 else _bound_stats(parts[0], cap))
-            total = (wave_total if total is None
-                     else _bound_stats(_merge_two(total, wave_total), cap))
+        while in_flight:
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                in_flight.remove(fut)
+                buffer.append(fut.result())
+            # Combine before refill so we release batch dicts promptly.
+            while len(buffer) >= n:
+                total = _fold_batch(buffer[:n], total)
+                del buffer[:n]
+            _fill()
+        if buffer:
+            total = _fold_batch(buffer, total)
         assert total is not None
         return total
 
