@@ -172,8 +172,6 @@ class BatchTokenizer(Tokenizer):
                     "BPE merge loop made no progress: empty stats or no safe pairs to merge "
                     f"(stats={len(stats)}, merges_remaining={merges_remaining}). "
                     "Often caused by an empty training corpus.")
-            if not merges_remaining:   # no need to merge last batch
-                break
             stats = corpus.merge_and_recount(pairs_to_merge, mult)
             seen_first.clear()
             seen_last.clear()
