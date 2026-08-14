@@ -34,7 +34,8 @@ class BatchTokenizer(Tokenizer):
         probably don't want to change the cap_divisor or max_batch_size defaults.
 
         - data: text, path(s), URL(s), list thereof, or a stream of text records.
-        - vocab_size: target vocabulary size (including the initial 256 bytes).
+        - vocab_size: target number of active vocabulary entries, including the
+          initial 243 UTF-8 byte tokens.
         - cap_divisor: divides remaining merges to size each batch (default 2).
         - max_batch_size: hard cap on merges per batch; 0 = no cap beyond remaining.
         - backend: "ram" (in-memory) or "disk" (sharded corpus for large data).
@@ -159,9 +160,10 @@ class BatchTokenizer(Tokenizer):
                 add_last(last)
                 if unsafe:
                     continue # skip this pair but keep looking for safe merges in top_pairs
-                pairs_to_merge[packed] = curr_vocab_size
-                merges[(first, last)] = curr_vocab_size  # model keeps tuple keys
-                vocab[curr_vocab_size] = vocab[first] + vocab[last]
+                idx = self._next_vocab_id()
+                pairs_to_merge[packed] = idx
+                merges[(first, last)] = idx  # model keeps tuple keys
+                vocab[idx] = vocab[first] + vocab[last]
                 curr_vocab_size += 1
             merges_remaining -= (num_pairs_to_merge := len(pairs_to_merge))
             batch_count += 1

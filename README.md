@@ -64,18 +64,18 @@ For an example that's easy to inspect, we can reproduce the [Wikipedia example o
 from batchbpe import BatchTokenizer
 tokenizer = BatchTokenizer()
 text = "aaabdaaabac"
-tokenizer.train(text, 256 + 3) # 256 are the byte tokens, then do 3 merges
+tokenizer.train(text, 243 + 3) # 243 valid UTF-8 byte tokens, then do 3 merges
 print(tokenizer.encode(text))
-# [258, 100, 258, 97, 99]
-print(tokenizer.decode([258, 100, 258, 97, 99]))
+# [245, 100, 245, 97, 99]
+print(tokenizer.decode([245, 100, 245, 97, 99]))
 # aaabdaaabac
 tokenizer.save("toy")
 # writes two files: toy.model (for loading) and toy.vocab (for viewing)
 ```
 
-According to Wikipedia, running bpe on the input string: "aaabdaaabac" for 3 merges results in the string: "XdXac" where  X=ZY, Y=ab, and Z=aa. The tricky thing to note is that BatchBPE always allocates the 256 individual bytes as tokens, and then merges bytes as needed from there. So for us a=97, b=98, c=99, d=100 (their [ASCII](https://www.asciitable.com) values). Then when (a,a) is merged to Z, Z will become 256. Likewise Y will become 257 and X 258. So we start with the 256 bytes, and do 3 merges to get to the result above, with the expected output of [258, 100, 258, 97, 99].
+According to Wikipedia, running bpe on the input string: "aaabdaaabac" for 3 merges results in the string: "XdXac" where X=ZY, Y=ab, and Z=aa. BatchBPE begins with the 243 byte values that can appear in valid UTF-8. It reclaims the 13 impossible UTF-8 byte IDs (192, 193, and 245–255) for its first learned vocabulary entries. So for us a=97, b=98, c=99, d=100 (their [ASCII](https://www.asciitable.com) values). Then when (a,a) is merged to Z, Z becomes 192; Y becomes 193 and X becomes 245. The expected output is [245, 100, 245, 97, 99].
 
-This example also demonstrates that the batch merging approach to tokenization safely merges token pairs in batches. So in this highly artificial example, it makes the merges in the right order despite the fact that token 257 includes 256, and token 258 includes 257.
+This example also demonstrates that the batch merging approach to tokenization safely merges token pairs in batches. In this highly artificial example, it makes the merges in the right order despite token 193 including 192, and token 245 including 193.
 
 ## Accepted Import Types
 
@@ -151,7 +151,7 @@ tokenizer = BatchTokenizer(store_dict=True)   # note `store_dict` param
 paths = ['path_to_parquet_file_1', ... 'path_to_parquet_file_5']
 kwargs = [{'path': 'parquet', 'data_files': {'train': path}, 'split': 'train'} for path in paths]
 data = [load_dataset(**kwg) for kwg in kwargs]
-tokenizer.train(data, 256)   # calling train with vocab_size of 256 will do no merges, but does call _import_data
+tokenizer.train(data, 243)   # calling train with vocab_size of 243 will do no merges, but does call _import_data
 # the csv file will be saved in the format '{date}-{time}-dataset-dict.csv'
 
 # Then delete the five files, download the remaining dataset files and repeat the above with those files.

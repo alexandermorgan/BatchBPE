@@ -3,6 +3,7 @@ import tiktoken
 import os
 import tempfile
 from array import array
+from collections import Counter
 from batchbpe import BatchTokenizer
 from batchbpe.corpus import DiskCorpus, RamCorpus, _read_shard
 
@@ -81,18 +82,19 @@ def test_wikipedia_example(tokenizer_factory, backend):
     Y=ab
     Z=aa
 
-    Keep in mind that for us a=97, b=98, c=99, d=100 (ASCII values)
-    so Z will be 256, Y will be 257, X will be 258.
+    Keep in mind that for us a=97, b=98, c=99, d=100 (ASCII values).
+    The first learned merges reclaim IDs 192, 193, and 245, so Z will
+    be 192, Y will be 193, and X will be 245.
 
-    So we expect the output list of ids to be [258, 100, 258, 97, 99]
+    So we expect the output list of ids to be [245, 100, 245, 97, 99].
     """
     tokenizer = tokenizer_factory(multiprocess=False)
     text = "aaabdaaabac"
     with tempfile.TemporaryDirectory() as work_dir:
-        tokenizer.train(text, 256 + 3, backend=backend,
+        tokenizer.train(text, 243 + 3, backend=backend,
                         work_dir=work_dir if backend == "disk" else None)
     ids = tokenizer.encode(text)
-    assert ids == [258, 100, 258, 97, 99]
+    assert ids == [245, 100, 245, 97, 99]
     assert tokenizer.decode(tokenizer.encode(text)) == text
 
 
@@ -102,9 +104,24 @@ def test_wikipedia_memory_efficient(backend):
     tokenizer = BatchTokenizer(multiprocess=False)
     text = "aaabdaaabac"
     with tempfile.TemporaryDirectory() as work_dir:
-        tokenizer.train(text, 256 + 3, backend=backend, memory_efficient=True,
+        tokenizer.train(text, 243 + 3, backend=backend, memory_efficient=True,
                         work_dir=work_dir if backend == "disk" else None)
-    assert tokenizer.encode(text) == [258, 100, 258, 97, 99]
+    assert tokenizer.encode(text) == [245, 100, 245, 97, 99]
+
+
+def test_dead_utf8_bytes_are_reclaimed_by_early_merges():
+    tokenizer = BatchTokenizer(multiprocess=False)
+    tokenizer.train("aaabdaaabac", 243 + 3)
+
+    assert list(tokenizer.merges.values()) == [192, 193, 245]
+    assert set(range(256)) - set(tokenizer.vocab) == set(range(246, 256))
+
+
+def test_stop_words_reclaim_dead_utf8_bytes_first():
+    tokenizer = BatchTokenizer(multiprocess=False, stop_list_size=2)
+    tokenizer._id_dict_to_list(Counter({"alpha": 5, "beta": 4}))
+
+    assert tokenizer.stop_words == {"alpha": 192, "beta": 193}
 
 
 def test_get_stats_respects_max_stats_size():
@@ -372,7 +389,7 @@ def test_ram_disk_identical_vocab_superbpe_stages():
 def test_disk_backend_temp_work_dir_cleaned_up():
     """Omitting work_dir uses a temp dir that DiskCorpus removes on close."""
     tok = BatchTokenizer(multiprocess=False)
-    tok.train("aaabdaaabac", 256 + 3, backend="disk")
+    tok.train("aaabdaaabac", 243 + 3, backend="disk")
 
 
 def test_empty_corpus_does_not_hang():
@@ -380,7 +397,7 @@ def test_empty_corpus_does_not_hang():
     tok = BatchTokenizer(pattern=None, multiprocess=False)
     docs = ["aaabdaaabac"]
     with tempfile.TemporaryDirectory() as work_dir:
-        tok.train(docs, 256 + 3, backend="disk", work_dir=work_dir)
+        tok.train(docs, 243 + 3, backend="disk", work_dir=work_dir)
     assert docs == []  # cleared after sharding
     tok2 = BatchTokenizer(pattern=None, multiprocess=False)
     with tempfile.TemporaryDirectory() as work_dir, pytest.raises(RuntimeError, match="no safe pairs"):

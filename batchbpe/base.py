@@ -25,6 +25,10 @@ _tls = threading.local()  # thread-local compiled pattern cache
 GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
+# These byte values can never be produced by UTF-8 encoding. Their token IDs
+# are reclaimed by the first learned vocabulary entries.
+DEAD_UTF8_BYTES = dict.fromkeys((0xC0, 0xC1, *range(0xF5, 0x100)))
+
 # -----------------------------------------------------------------------------
 # a few helper functions
 
@@ -136,7 +140,8 @@ class Tokenizer:
         - freq_cutoff: drop chunks seen fewer times than this (1 = keep all with count >= 1).
         - dedup: Counter-dedup chunks on import. None = auto (True with a pattern, False open-field).
         """
-        # default: vocab size of 256 (all bytes), no merges, no patterns
+        # Start with the 243 bytes that may occur in valid UTF-8. The remaining
+        # 13 byte-ID slots are filled by the first learned vocabulary entries.
         self.merges = {} # (int, int) -> int
         self.special_tokens = {} # str -> int, e.g. {'<|endoftext|>': 100257}
         self.vocab = self._build_vocab() # int -> bytes
@@ -163,6 +168,22 @@ class Tokenizer:
         """
         self.dedup = self.pattern is not None if dedup is None else dedup
 
+    def _next_vocab_id(self) -> int:
+        """Return the next free token ID.
+
+        New vocabulary entries use the 13 IDs that cannot occur as UTF-8 bytes
+        before allocating IDs from 256 onward.
+        """
+        special_ids = set(self.special_tokens.values())
+        for idx in DEAD_UTF8_BYTES:
+            if idx not in self.vocab and idx not in special_ids:
+                return idx
+
+        idx = 256
+        while idx in self.vocab or idx in special_ids:
+            idx += 1
+        return idx
+
     def _id_dict_to_list(self, ids, *, encode_with_vocab: bool = False):
         """
         Given a dictionary of token counts, return a list of lists where
@@ -184,15 +205,14 @@ class Tokenizer:
         if self.stop_list_size:
             # get twice as many to be sure to be able to get X chunks of length > 1
             top2X = ids.most_common(2*self.stop_list_size)
-            index = len(self.vocab)
-            stop_index = index + self.stop_list_size
+            index = self._next_vocab_id()
             stop_words = {}
             for key, val in top2X:
                 if len(key) > 1:
                     stop_words[key] = index
                     self.vocab[index] = str_encode(key, 'utf-8')
-                    index += 1
-                if index == stop_index:
+                    index = self._next_vocab_id()
+                if len(stop_words) == self.stop_list_size:
                     break
             self.stop_words = stop_words
             
@@ -489,7 +509,11 @@ class Tokenizer:
 
     def _build_vocab(self):
         # vocab is simply and deterministically derived from merges
-        vocab = {idx: bytes([idx]) for idx in range(256)}
+        vocab = {
+            idx: bytes([idx])
+            for idx in range(256)
+            if idx not in DEAD_UTF8_BYTES
+        }
         for (p0, p1), idx in self.merges.items():
             vocab[idx] = vocab[p0] + vocab[p1]
         for special, idx in self.special_tokens.items():
@@ -549,8 +573,7 @@ class Tokenizer:
                     s1 = render_token(self.vocab[idx1])
                     f.write(f"[{s0}][{s1}] -> [{s}] {idx}\n")
                 else:
-                    # otherwise this is leaf token, just print it
-                    # (this should just be the first 256 tokens, the bytes)
+                    # otherwise this is a leaf token
                     f.write(f"[{s}] {idx}\n")
 
     def load(self, model_file):
@@ -560,9 +583,8 @@ class Tokenizer:
         """
         assert model_file.endswith(".model")
         # read the model file
-        merges = {}
         special_tokens = {}
-        idx = 256
+        merge_pairs = []
         with open(model_file, 'r', encoding="utf-8") as f:
             # read the version
             version = f.readline().strip()
@@ -577,11 +599,15 @@ class Tokenizer:
             # read the merges
             for line in f:
                 idx1, idx2 = map(int, line.split())
-                merges[(idx1, idx2)] = idx
-                idx += 1
-        self.merges = merges
+                merge_pairs.append((idx1, idx2))
+
+        self.merges = {}
         self.special_tokens = special_tokens
         self.vocab = self._build_vocab()
+        for pair in merge_pairs:
+            idx = self._next_vocab_id()
+            self.merges[pair] = idx
+            self.vocab[idx] = self.vocab[pair[0]] + self.vocab[pair[1]]
         self.compiled_pattern = re.compile(self.pattern) if self.pattern is not None else None
 
     def decode(self, ids):
