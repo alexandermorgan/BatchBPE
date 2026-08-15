@@ -145,6 +145,7 @@ class Tokenizer:
         self.merges = {} # (int, int) -> int
         self.special_tokens = {} # str -> int, e.g. {'<|endoftext|>': 100257}
         self.vocab = self._build_vocab() # int -> bytes
+        self._vocab_id_cursor = 191
         self.pattern = pattern
         self.compiled_pattern = re.compile(self.pattern) if self.pattern is not None else None
         self.multiprocess = multiprocess
@@ -179,20 +180,22 @@ class Tokenizer:
         self._set_dedup(dedup)
 
     def _next_vocab_id(self) -> int:
-        """Return the next free token ID.
+        """Return and reserve the next learned-vocabulary token ID.
 
         New vocabulary entries use the 13 IDs that cannot occur as UTF-8 bytes
-        before allocating IDs from 256 onward.
+        before allocating IDs from 256 onward. The cursor only moves forward,
+        avoiding a scan through every previously allocated ID.
         """
-        special_ids = set(self.special_tokens.values())
-        for idx in DEAD_UTF8_BYTES:
-            if idx not in self.vocab and idx not in special_ids:
-                return idx
-
-        idx = 256
-        while idx in self.vocab or idx in special_ids:
-            idx += 1
-        return idx
+        while True:
+            if self._vocab_id_cursor == 193:
+                self._vocab_id_cursor = 245
+            else:
+                self._vocab_id_cursor += 1
+            if (
+                self._vocab_id_cursor not in self.vocab
+                and self._vocab_id_cursor not in self.special_tokens.values()
+            ):
+                return self._vocab_id_cursor
 
     def _id_dict_to_list(self, ids, *, encode_with_vocab: bool = False):
         """
@@ -537,6 +540,7 @@ class Tokenizer:
         """
         self.special_tokens = special_tokens
         self.inverse_special_tokens = {v: k for k, v in special_tokens.items()}
+        self._vocab_id_cursor = 191
 
     def save(self, file_prefix):
         """
@@ -614,6 +618,7 @@ class Tokenizer:
         self.merges = {}
         self.special_tokens = special_tokens
         self.vocab = self._build_vocab()
+        self._vocab_id_cursor = 191
         for pair in merge_pairs:
             idx = self._next_vocab_id()
             self.merges[pair] = idx
