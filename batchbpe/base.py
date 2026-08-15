@@ -168,6 +168,16 @@ class Tokenizer:
         """
         self.dedup = self.pattern is not None if dedup is None else dedup
 
+    def set_pattern(self, pattern: str | None, dedup: bool | None = None) -> None:
+        """Set the chunk-splitting pattern and synchronize related state.
+
+        - pattern: regex string, or None for open-field tokenization.
+        - dedup: True/False to force, or None to choose based on the pattern.
+        """
+        self.pattern = pattern
+        self.compiled_pattern = re.compile(pattern) if pattern is not None else None
+        self._set_dedup(dedup)
+
     def _next_vocab_id(self) -> int:
         """Return the next free token ID.
 
