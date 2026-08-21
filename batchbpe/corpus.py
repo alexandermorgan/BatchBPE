@@ -409,6 +409,65 @@ class DiskCorpus(Corpus):
                    max_stats_size=max_stats_size,
                    _shard_paths=paths, _owns_dir=owns_dir)
 
+    @classmethod
+    def from_manifest(cls, work_dir: str, n: int,
+                      max_stats_size: int = 0) -> "DiskCorpus":
+        """Open an existing sharded corpus without re-tokenizing its source.
+
+        The directory is never owned by the returned corpus, so ``close()`` does
+        not delete a resumable checkpoint. The caller must load the same model
+        that produced the token IDs stored in the shards.
+        """
+        manifest_path = os.path.join(work_dir, _MANIFEST_NAME)
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+        except FileNotFoundError as error:
+            raise FileNotFoundError(
+                f"disk corpus manifest not found: {manifest_path}"
+            ) from error
+
+        version = manifest.get("version")
+        if version != _SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported disk corpus version {version!r}; "
+                f"expected {_SCHEMA_VERSION}"
+            )
+
+        shard_names = manifest.get("shards")
+        if not isinstance(shard_names, list) or not all(
+            isinstance(name, str) and os.path.basename(name) == name
+            for name in shard_names
+        ):
+            raise ValueError("manifest contains invalid shard names")
+        if manifest.get("n_shards") != len(shard_names):
+            raise ValueError("manifest n_shards does not match its shard list")
+
+        chunk_counts = manifest.get("chunk_counts")
+        if not isinstance(chunk_counts, list) or len(chunk_counts) != len(shard_names):
+            raise ValueError("manifest chunk_counts does not match its shard list")
+
+        paths = [os.path.join(work_dir, name) for name in shard_names]
+        missing = [path for path in paths if not os.path.isfile(path)]
+        if missing:
+            raise FileNotFoundError(
+                f"manifest references {len(missing)} missing shard(s); "
+                f"first missing shard: {missing[0]}"
+            )
+
+        records_per_shard = manifest.get("records_per_shard")
+        if not isinstance(records_per_shard, int) or records_per_shard < 1:
+            raise ValueError("manifest records_per_shard must be a positive integer")
+
+        return cls(
+            n=n,
+            work_dir=work_dir,
+            records_per_shard=records_per_shard,
+            max_stats_size=max_stats_size,
+            _shard_paths=paths,
+            _owns_dir=False,
+        )
+
     def _materialize(self, ids: list[array[int]]) -> list[str]:
         """Write ids as contiguous shards of `records_per_shard` chunks each."""
         paths: list[str] = []

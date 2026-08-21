@@ -28,7 +28,8 @@ class BatchTokenizer(Tokenizer):
     def train(self, data, vocab_size: int, cap_divisor: int = 2,
               max_batch_size: int = 0, backend: str = "ram", work_dir: str | None = None,
               memory_efficient: bool = False, verbose: bool = False,
-              records_per_shard: int | None = None) -> None:
+              records_per_shard: int | None = None,
+              resume_from_manifest: str | None = None) -> None:
         """
         Trains the tokenizer on the given data to the specified vocab_size. You
         probably don't want to change the cap_divisor or max_batch_size defaults.
@@ -44,6 +45,9 @@ class BatchTokenizer(Tokenizer):
         - records_per_shard: disk-backend chunk buffer size; lower values use less
           import RAM but create more shard files. Required for bounded streaming
           input: use backend="disk" and dedup=False.
+        - resume_from_manifest: existing disk-corpus directory containing
+          manifest.json. Skips data import and resumes merge training in place;
+          the loaded tokenizer model must match the shard token IDs.
         - verbose: print per-batch timing during the merge loop.
 
         Calling train() again with the same split pattern and backend="ram"
@@ -59,6 +63,12 @@ class BatchTokenizer(Tokenizer):
             raise ValueError(f"backend must be 'ram' or 'disk', got {backend!r}")
         if records_per_shard is not None and records_per_shard < 1:
             raise ValueError("records_per_shard must be at least 1")
+        if resume_from_manifest is not None and backend != "disk":
+            raise ValueError("resume_from_manifest requires backend='disk'")
+        if resume_from_manifest is not None and work_dir is not None:
+            raise ValueError(
+                "work_dir and resume_from_manifest are mutually exclusive"
+            )
 
         encode_with_vocab = bool(self.merges)
         max_stats_size = vocab_size*5 if memory_efficient else 0
@@ -67,6 +77,27 @@ class BatchTokenizer(Tokenizer):
         if backend == "disk":
             self._corpus_ids = None
             self._corpus_pattern = None
+            if resume_from_manifest is not None:
+                corpus = DiskCorpus.from_manifest(
+                    resume_from_manifest,
+                    self._cpus,
+                    max_stats_size=max_stats_size,
+                )
+                t1 = time.time()
+                print(
+                    f"Resuming disk corpus from {resume_from_manifest} "
+                    f"({len(corpus._shard_paths):,} shards)"
+                )
+                with corpus:
+                    self._build_merges(
+                        corpus,
+                        vocab_size,
+                        cap_divisor,
+                        max_batch_size,
+                        t1,
+                        verbose,
+                    )
+                return
             if self.dedup:
                 ids = self._import_data(data, encode_with_vocab=encode_with_vocab)
                 t1 = time.time()
@@ -181,3 +212,4 @@ class BatchTokenizer(Tokenizer):
                 t2 = time.time()
                 print(f"Batch {batch_count} merged {num_pairs_to_merge} pairs in {t2-t1:.2f} sec. Merges remaining: {merges_remaining}")
                 t1 = t2
+        self._invalidate_encoding_caches()

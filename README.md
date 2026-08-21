@@ -110,6 +110,39 @@ data = load_dataset(**kwargs).data['text']
 tokenizer.train(data, 50304, verbose=True)
 ```
 
+### Tiktoken-accelerated multi-stage imports
+
+When a tokenizer already has learned merges, the next `train()` call must
+encode every new text chunk with that existing vocabulary before it can count
+new pairs. By default, BatchBPE uses tiktoken for this one-time corpus-import
+step. It builds a snapshot from the current BatchBPE vocabulary, then BatchBPE
+continues to apply and learn merge batches natively against the resulting token
+arrays.
+
+```python
+from batchbpe import BatchTokenizer
+
+tokenizer = BatchTokenizer()
+tokenizer.train(stage_one_data, 45298)  # fresh import: native UTF-8 bytes
+tokenizer.set_pattern(None)             # open-field second stage
+tokenizer.train(stage_two_data, 50304, backend="disk")  # tiktoken import
+```
+
+BatchBPE always performs its own splitting first, then gives each resulting
+chunk to tiktoken as one field. This preserves custom split patterns and
+open-field (`pattern=None`) behavior. Public `encode()`, `encode_ordinary()`,
+and `decode()` remain native BatchBPE methods. To force the native importer for
+an experiment, call:
+
+```python
+tokenizer.set_encoding_backend("native")
+```
+
+Fresh imports without learned merges always use native UTF-8 conversion because
+there is no BPE work for tiktoken to accelerate. Imports using `stop_list_size`
+also fall back to the native path so the exact whole-chunk stop-word behavior
+is preserved.
+
 It is also possible to stream records from a Hugging Face dataset without retaining the source texts in memory. With `dedup=True`, BatchBPE processes small input batches and aggregates their split chunks into one in-memory count dictionary before training. For example, to stream the first 800 records from FineWeb-Edu's 10B-token sample:
 
 ```bash

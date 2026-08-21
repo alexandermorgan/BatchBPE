@@ -18,16 +18,23 @@ import time
 import os
 import regex as re
 import csv
+import tiktoken
 
 _tls = threading.local()  # thread-local compiled pattern cache
 # the main GPT text split patterns, see
 # https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
 GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+# This exact pattern can also be passed directly to tiktoken as ``pat_str``.
+# Tests verify that Python regex and tiktoken's Rust regex produce equal chunks.
 GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
 # These byte values can never be produced by UTF-8 encoding. Their token IDs
 # are reclaimed by the first learned vocabulary entries.
 DEAD_UTF8_BYTES = dict.fromkeys((0xC0, 0xC1, *range(0xF5, 0x100)))
+# Used only when an input is already one pre-tokenized piece. Long documents
+# should normally use GPT4_SPLIT_PATTERN; BPE over one giant piece is very slow.
+TIKTOKEN_CHUNK_PATTERN = r"(?s:.)+"
+TIKTOKEN_BATCH_SIZE = 4096
 
 # -----------------------------------------------------------------------------
 # a few helper functions
@@ -148,6 +155,11 @@ class Tokenizer:
         self._vocab_id_cursor = 191
         self.pattern = pattern
         self.compiled_pattern = re.compile(self.pattern) if self.pattern is not None else None
+        # Optional pretokenization used while applying an existing vocabulary
+        # during corpus import. This is intentionally independent of `pattern`,
+        # which controls the rows/boundaries seen by subsequent merge waves.
+        self.import_encoding_pattern = None
+        self.compiled_import_encoding_pattern = None
         self.multiprocess = multiprocess
         if multiprocess:
             self._cpus = os.cpu_count() or 1
@@ -157,6 +169,9 @@ class Tokenizer:
         self.stop_list_size = stop_list_size
         self.stop_words = {}
         self.freq_cutoff = freq_cutoff
+        self.encoding_backend = "tiktoken"
+        self._tiktoken_encoding = None
+        self._tiktoken_vocab_size = None
         self._set_dedup(dedup)
 
     def _set_dedup(self, dedup: bool | None = None) -> None:
@@ -178,6 +193,103 @@ class Tokenizer:
         self.pattern = pattern
         self.compiled_pattern = re.compile(pattern) if pattern is not None else None
         self._set_dedup(dedup)
+        self._invalidate_encoding_caches()
+
+    def set_import_encoding_pattern(self, pattern: str | None) -> None:
+        """Pretokenize each corpus row while applying an existing vocabulary.
+
+        This is separate from ``set_pattern``:
+
+        - ``pattern`` on the tokenizer determines corpus rows and therefore the
+          boundaries that newly trained merges may cross.
+        - ``import_encoding_pattern`` determines how the already-learned BPE
+          vocabulary is applied inside each row before those new merges begin.
+
+        For SuperBPE, set the corpus pattern to ``None`` (one row per document)
+        and this pattern to ``GPT4_SPLIT_PATTERN``. Tiktoken then performs normal
+        GPT-4 pretokenization and returns one flattened token list per document,
+        allowing the following merge wave to cross the former GPT-4 boundaries.
+
+        ``None`` means each supplied corpus row is one BPE piece.
+        """
+        self.import_encoding_pattern = pattern
+        self.compiled_import_encoding_pattern = (
+            re.compile(pattern) if pattern is not None else None
+        )
+        self._invalidate_encoding_caches()
+
+    def set_encoding_backend(self, backend: str) -> None:
+        """Choose the backend for corpus imports with existing BPE merges.
+
+        - backend: ``"tiktoken"`` (default) or ``"native"``.
+
+        Fresh imports remain native UTF-8 conversion because no BPE merges need
+        applying. Public ``encode*`` methods always remain native.
+        """
+        if backend not in {"native", "tiktoken"}:
+            raise ValueError(
+                f"encoding backend must be 'native' or 'tiktoken', got {backend!r}"
+            )
+        self.encoding_backend = backend
+
+    def _invalidate_encoding_caches(self) -> None:
+        """Discard cached encodings after vocabulary or pattern changes."""
+        self._encode_chunk.cache_clear()
+        self._tiktoken_encoding = None
+        self._tiktoken_vocab_size = None
+
+    def _uses_tiktoken_for_import(self, encode_with_vocab: bool) -> bool:
+        """Whether an import should use the cached tiktoken BPE snapshot."""
+        return (
+            encode_with_vocab
+            and self.encoding_backend == "tiktoken"
+            and bool(self.merges)
+            and not self.stop_words
+        )
+
+    def _get_tiktoken_encoding(self) -> tiktoken.Encoding:
+        """Return a current-vocabulary tiktoken encoder for corpus imports."""
+        vocab_size = len(self.vocab)
+        if (
+            self._tiktoken_encoding is None
+            or self._tiktoken_vocab_size != vocab_size
+        ):
+            special_ids = set(self.special_tokens.values())
+            mergeable_ranks = {
+                token_bytes: token_id
+                for token_id, token_bytes in self.vocab.items()
+                if token_id not in special_ids
+            }
+            self._tiktoken_encoding = tiktoken.Encoding(
+                name="batchbpe-import",
+                pat_str=self.import_encoding_pattern or TIKTOKEN_CHUNK_PATTERN,
+                mergeable_ranks=mergeable_ranks,
+                special_tokens={},
+            )
+            self._tiktoken_vocab_size = vocab_size
+        return self._tiktoken_encoding
+
+    def _encode_import_batch(
+        self, texts: Iterable[str], *, encode_with_vocab: bool
+    ) -> list[list[int]]:
+        """Encode corpus rows with the selected import backend."""
+        texts = list(texts)
+        if self._uses_tiktoken_for_import(encode_with_vocab):
+            return [
+                list(ids)
+                for ids in self._get_tiktoken_encoding().encode_ordinary_batch(texts)
+            ]
+        if encode_with_vocab:
+            if self.compiled_import_encoding_pattern is None:
+                return [self._encode_chunk_core(text) for text in texts]
+            result = []
+            for text in texts:
+                tokens = []
+                for match in self.compiled_import_encoding_pattern.finditer(text):
+                    tokens.extend(self._encode_chunk_core(match.group()))
+                result.append(tokens)
+            return result
+        return [list(text.encode("utf-8")) for text in texts]
 
     def _next_vocab_id(self) -> int:
         """Return and reserve the next learned-vocabulary token ID.
@@ -214,7 +326,6 @@ class Tokenizer:
         """
         result = []
         str_encode = str.encode
-        encode = self._encode_chunk_core if encode_with_vocab else (lambda k: str_encode(k, 'utf-8'))
         if self.stop_list_size:
             # get twice as many to be sure to be able to get X chunks of length > 1
             top2X = ids.most_common(2*self.stop_list_size)
@@ -228,19 +339,34 @@ class Tokenizer:
                 if len(stop_words) == self.stop_list_size:
                     break
             self.stop_words = stop_words
+            self._invalidate_encoding_caches()
             
             while ids:
                 key, val = ids.popitem()
                 if key in self.stop_words or 1 < self.freq_cutoff > val:
                     continue
                 # Count at the beginning, then tokens
-                result.append(array('i', [val, *encode(key)]))
+                tokens = (
+                    self._encode_chunk_core(key)
+                    if encode_with_vocab
+                    else list(str_encode(key, "utf-8"))
+                )
+                result.append(array('i', [val, *tokens]))
         else:
-            result = [
-                array('i', [val, *encode(key)])
+            filtered_items = (
+                (key, val)
                 for key, val in ids.items()
                 if not (1 < self.freq_cutoff > val)
-            ]
+            )
+            for item_batch in batched(filtered_items, TIKTOKEN_BATCH_SIZE):
+                texts = [key for key, _ in item_batch]
+                token_batches = self._encode_import_batch(
+                    texts, encode_with_vocab=encode_with_vocab
+                )
+                result.extend(
+                    array("i", [val, *tokens])
+                    for (_, val), tokens in zip(item_batch, token_batches, strict=True)
+                )
         return result
 
     def _iter_chunk_texts(self, data):
@@ -344,12 +470,14 @@ class Tokenizer:
         """
         if self.stop_list_size:
             raise ValueError("stop_list_size requires dedup=True")
-        str_encode = str.encode
-        encode = self._encode_chunk_core if encode_with_vocab else (lambda k: str_encode(k, 'utf-8'))
-        for text in self._iter_chunk_texts(data):
-            if 1 < self.freq_cutoff > 1:
-                continue  # count is always 1; freq_cutoff>1 drops everything
-            yield array('i', [1, *encode(text)])
+        if 1 < self.freq_cutoff > 1:
+            return  # count is always 1; freq_cutoff>1 drops everything
+        for text_batch in batched(self._iter_chunk_texts(data), TIKTOKEN_BATCH_SIZE):
+            token_batches = self._encode_import_batch(
+                text_batch, encode_with_vocab=encode_with_vocab
+            )
+            for tokens in token_batches:
+                yield array("i", [1, *tokens])
 
     def _import_data(self, data, *, encode_with_vocab: bool = False) -> list:
         """
@@ -541,6 +669,7 @@ class Tokenizer:
         self.special_tokens = special_tokens
         self.inverse_special_tokens = {v: k for k, v in special_tokens.items()}
         self._vocab_id_cursor = 191
+        self._invalidate_encoding_caches()
 
     def save(self, file_prefix):
         """
@@ -624,6 +753,7 @@ class Tokenizer:
             self.merges[pair] = idx
             self.vocab[idx] = self.vocab[pair[0]] + self.vocab[pair[1]]
         self.compiled_pattern = re.compile(self.pattern) if self.pattern is not None else None
+        self._invalidate_encoding_caches()
 
     def decode(self, ids):
         """Decode token ids back to a Python string.

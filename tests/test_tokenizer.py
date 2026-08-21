@@ -5,6 +5,7 @@ import tempfile
 from array import array
 from collections import Counter
 from batchbpe import BatchTokenizer
+from batchbpe.base import GPT4_SPLIT_PATTERN
 from batchbpe.corpus import DiskCorpus, RamCorpus, _read_shard
 
 # -----------------------------------------------------------------------------
@@ -224,6 +225,57 @@ def test_disk_backend_accepts_text_record_streams():
                    records_per_shard=1)
     assert disk.merges == ram.merges
     assert disk.vocab == ram.vocab
+
+
+def test_disk_training_resumes_from_manifest_without_reimport():
+    """A completed tokenized corpus can resume merge training in place."""
+    docs = [
+        "aaabdaaabac and some ordinary words",
+        "the quick brown fox jumps over the lazy dog",
+        "Café 你好 — repeated repeated text",
+    ]
+    stage_one_size = 256 + 12
+    final_size = stage_one_size + 6
+
+    def stage_one_tokenizer():
+        tokenizer = BatchTokenizer(multiprocess=False, dedup=False)
+        tokenizer.train(docs, stage_one_size, backend="ram")
+        tokenizer.set_pattern(None, dedup=False)
+        tokenizer.set_import_encoding_pattern(GPT4_SPLIT_PATTERN)
+        return tokenizer
+
+    with tempfile.TemporaryDirectory() as parent:
+        checkpoint_dir = os.path.join(parent, "checkpoint")
+        expected_dir = os.path.join(parent, "expected")
+
+        resumed = stage_one_tokenizer()
+        corpus = DiskCorpus.from_chunk_iter(
+            resumed._iter_chunk_arrays(iter(docs), encode_with_vocab=True),
+            n=1,
+            work_dir=checkpoint_dir,
+            records_per_shard=2,
+        )
+        corpus.close()
+
+        expected = stage_one_tokenizer()
+        expected.train(
+            list(docs),
+            final_size,
+            backend="disk",
+            work_dir=expected_dir,
+            records_per_shard=2,
+        )
+
+        resumed.train(
+            None,
+            final_size,
+            backend="disk",
+            resume_from_manifest=checkpoint_dir,
+        )
+
+        assert resumed.merges == expected.merges
+        assert resumed.vocab == expected.vocab
+        assert os.path.isfile(os.path.join(checkpoint_dir, "manifest.json"))
 
 
 def test_ram_backend_deduplicates_text_record_streams():
