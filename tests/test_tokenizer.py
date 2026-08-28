@@ -125,23 +125,105 @@ def test_stop_words_reclaim_dead_utf8_bytes_first():
     assert tokenizer.stop_words == {"alpha": 192, "beta": 193}
 
 
-def test_get_stats_respects_max_stats_size():
-    """Bounded get_stats keeps exact top-k counts and never exceeds max_stats_size."""
+def test_get_stats_trims_only_after_3x_trigger():
+    """Shards trim mid-walk after 3x cap; finishing a shard does not trim."""
     from batchbpe.corpus import get_stats
-    # Many distinct pairs: (0,1), (1,2), ..., (n-2, n-1)
-    n = 50
-    chunk = array("i", [1, *range(n)])
-    capped = get_stats([chunk], mult=1000, max_stats_size=10)
-    assert len(capped) == 10
-    full = get_stats([chunk], mult=1000)
-    assert len(full) == n - 1
-    # Truncation keeps the true highest counts unchanged.
-    for packed, count in capped.items():
-        assert full[packed] == count
-    # Under the cap, result matches the unbounded path exactly.
-    small = array("i", [3, 1, 2, 1, 2])
-    stats = get_stats([small], mult=1000, max_stats_size=10)
-    assert stats == get_stats([small], mult=1000)
+    # 25 keys < 3*10=30: no mid-walk trim, no end trim.
+    chunks = [array("i", [1, i, i + 1]) for i in range(0, 48, 2)]
+    chunks.append(array("i", [5, 80, 81]))
+    below = get_stats(chunks, mult=1000, max_stats_size=10)
+    assert below[80 * 1000 + 81] == 5
+    assert len(below) == 25
+
+    # Mid-stream 3x overflow keeps the high-count pair; hapaxes may re-enter.
+    chunks = [array("i", [5, 80, 81])]
+    chunks.extend(array("i", [1, i, i + 1]) for i in range(0, 80, 2))
+    pruned = get_stats(chunks, mult=1000, max_stats_size=10)
+    assert pruned[80 * 1000 + 81] == 5
+    assert len(pruned) < 41
+
+    # All hapaxes: overflow bins to the cap, then later hapaxes can accumulate.
+    hapax_only = [array("i", [1, i, i + 1]) for i in range(0, 80, 2)]
+    kept = get_stats(hapax_only, mult=1000, max_stats_size=10)
+    assert 10 <= len(kept) < 40
+    assert all(v == 1 for v in kept.values())
+
+
+def test_bound_stats_exact_count_bins():
+    """Each exact count is its own bin; partial bins keep highest packed ids."""
+    from collections import defaultdict
+    from heapq import nlargest
+    from batchbpe.corpus import _bound_stats
+
+    # Under cap: no prune.
+    small = defaultdict(int, {1: 5, 2: 1, 3: 2})
+    assert dict(_bound_stats(defaultdict(int, small), 10)) == {1: 5, 2: 1, 3: 2}
+
+    # Over cap: dropping the whole count-1 bin is enough.
+    mixed = defaultdict(int, {1: 5, 2: 1, 3: 2, 4: 1, 5: 9})
+    assert dict(_bound_stats(defaultdict(int, mixed), 3)) == {1: 5, 3: 2, 5: 9}
+
+    # extra < n_ones: keep the highest packed hapax ids to fill the cap.
+    counts = defaultdict(int)
+    for i in range(5):
+        counts[i] = 1
+    for i in range(100, 103):
+        counts[i] = 9
+    got = _bound_stats(counts, 4)
+    assert len(got) == 4
+    assert set(got) == {4, 100, 101, 102}
+
+    # Drop the entire count-2 bin before touching 3s.
+    counts = defaultdict(int)
+    for i in range(6):
+        counts[i] = 2
+    for i in range(10, 18):
+        counts[i] = 3
+    got = _bound_stats(counts, 8)
+    assert len(got) == 8
+    assert all(v == 3 for v in got.values())
+    assert set(got) == set(range(10, 18))
+
+    # Partial drop inside the count-2 bin keeps the tail in dict order.
+    counts = defaultdict(int)
+    for i in range(8):
+        counts[i] = 2
+    for i in range(100, 108):
+        counts[i] = 3
+    got = _bound_stats(counts, 10)
+    assert len(got) == 10
+    assert set(got) == {6, 7, *range(100, 108)}
+
+    # Same binning as nlargest by (count, packed id) on a small dense dict.
+    dense = defaultdict(int, {i: (i % 5) + 1 for i in range(80)})  # counts 1..5
+    expected = dict(nlargest(20, dense.items(), key=lambda kv: (kv[1], kv[0])))
+    assert dict(_bound_stats(defaultdict(int, dense), 20)) == expected
+
+    unbounded = defaultdict(int, {1: 1, 2: 8, 3: 2})
+    assert dict(_bound_stats(unbounded, 0)) == {1: 1, 2: 8, 3: 2}
+
+
+def test_trim_running_total_only_after_3x_trigger():
+    """The running total is left alone until it exceeds 3x capacity."""
+    from collections import defaultdict
+    from batchbpe.corpus import _trim_running_total
+
+    counts = defaultdict(int, {i: 2 for i in range(25)})
+    # 25 keys, cap 10, trigger 30: no trim.
+    assert len(_trim_running_total(defaultdict(int, counts), 10)) == 25
+    counts.update({i: 2 for i in range(25, 40)})
+    # 40 keys > 30: bin down to 10.
+    got = _trim_running_total(counts, 10)
+    assert len(got) == 10
+
+
+def test_get_stats_does_not_freeze_after_prune():
+    """Pairs that appear only after a hapax prune can still enter the dict."""
+    from batchbpe.corpus import get_stats
+    chunks = [array("i", [1, i, i + 1]) for i in range(0, 80, 2)]
+    chunks.extend([array("i", [1, 900, 901]) for _ in range(20)])
+    stats = get_stats(chunks, mult=1000, max_stats_size=10)
+    assert stats[900 * 1000 + 901] == 20
 
 
 @pytest.mark.parametrize("special_tokens", [{}, special_tokens])

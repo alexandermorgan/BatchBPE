@@ -14,10 +14,10 @@ the work is parallelized:
     with work-stealing; count-dicts are still tree-combined in worker-sized batches.
 
 Both backends accept `max_stats_size` (from train(memory_efficient=True)): when
-positive, pair-count dicts are kept to that many keys by repeatedly retaining
-the true top counts (exact values for survivors). Truncation runs per shard,
-after each combine step, and on the running disk aggregate so peak stats RAM
-stays O(max_stats_size) rather than O(unique pairs in the corpus). Early
+positive, a shard's pair-count dict is pruned whenever it grows past 3x the
+cap (lowest exact-count bins down to the cap). Finished shards are not trimmed.
+A wave of shard dicts is summed as-is, then folded into the running total;
+that running total is trimmed only when it itself exceeds 3x the cap. Early
 truncation can slightly change merge order vs the unbounded path.
 
 The chunk record format is shared with get_stats / merge_batch_and_get_stats:
@@ -36,7 +36,6 @@ from array import array
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from heapq import nlargest
 from itertools import batched
 import json
 import os
@@ -50,12 +49,58 @@ def _shards(seq: list[array[int]], n: int) -> batched[tuple[array[int], ...]]:
     return batched(seq, size)
 
 
+def _bin_to_capacity(counts: defaultdict[int, int], capacity: int) -> defaultdict[int, int]:
+    """Drop lowest exact-count bins until `len(counts) == capacity`.
+
+    Each exact count is its own bin (``list`` of packed ids). Dropped bins store
+    keys only. Kept keys are copied into a fresh dict with a plain loop.
+    """
+    remaining = len(counts) - capacity
+    if remaining <= 0:
+        return counts
+    by_count: defaultdict[int, list[int]] = defaultdict(list)
+    for k, v in counts.items():
+        by_count[v].append(k)
+    split_freq = 0   # freqs below this are fully dropped; at split_freq drop first `remaining` keys
+    for freq in sorted(by_count):
+        n = len(by_count[freq])
+        if remaining >= n:
+            remaining -= n
+            split_freq = freq + 1
+            if remaining == 0:
+                break
+        else:
+            split_freq = freq
+            break
+    kept = defaultdict[int, int](int)
+    for freq, keys in by_count.items():
+        if freq < split_freq:
+            continue
+        if remaining and freq == split_freq:
+            for k in keys[remaining:]:
+                kept[k] = freq
+        else:
+            for k in keys:
+                kept[k] = freq
+    return kept
+
+
 def _bound_stats(counts: defaultdict[int, int], capacity: int) -> defaultdict[int, int]:
-    """Keep at most `capacity` keys with exact counts (true top-k by count, then key)."""
+    """Cap `counts` at `capacity` keys by dropping the lowest exact-count bins.
+
+    No-op when `capacity <= 0` or the dict is already small enough.
+    """
     if capacity <= 0 or len(counts) <= capacity:
         return counts
-    return defaultdict[int, int](
-        int, nlargest(capacity, counts.items(), key=lambda kv: (kv[1], kv[0])))
+    return _bin_to_capacity(counts, capacity)
+
+
+def _trim_running_total(counts: defaultdict[int, int],
+                        capacity: int) -> defaultdict[int, int]:
+    """Trim the running aggregate only after it grows past 3x `capacity`."""
+    if capacity <= 0 or len(counts) <= capacity * 3:
+        return counts
+    return _bound_stats(counts, capacity)
 
 
 def _merge_two(a: defaultdict[int, int], b: defaultdict[int, int]) -> defaultdict[int, int]:
@@ -68,36 +113,35 @@ def _merge_two(a: defaultdict[int, int], b: defaultdict[int, int]) -> defaultdic
 
 
 def _combine_counts(parts: list[defaultdict[int, int]], pool: ThreadPoolExecutor | None,
-                    capacity: int = 0) -> defaultdict[int, int]:
+                    ) -> defaultdict[int, int]:
     """Sum a list of packed-int count dicts into one (the global pair stats).
 
     Reduced as a balanced binary tree: each wave merges disjoint pairs of dicts,
     halving the count per wave, so the merge depth is ceil(log2(len(parts)))
     waves (e.g. 8 shards -> 3, 16 -> 4, 32 -> 5) instead of len(parts)-1 serial
     merges. When `pool` is set, each wave runs concurrently on it; when `pool`
-    is None, merges run on the caller thread (avoids competing with in-flight
-    shard work on the same executor). When `capacity > 0`, each merge result is
-    truncated to that many keys so intermediates never grow with corpus size.
+    is None, merges run on the caller thread. Does not trim; the caller folds
+    into the running total and trims that dict if it exceeds 3x cap.
     """
+    if not parts:
+        return defaultdict[int, int](int)
     while len(parts) > 1:
         pairs = [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)]
         if pool is None:
             merged = [_merge_two(a, b) for a, b in pairs]
         else:
             merged = list[defaultdict[int, int]](pool.map(lambda ab: _merge_two(*ab), pairs))
-        if capacity > 0:
-            merged = [_bound_stats(m, capacity) for m in merged]
         if len(parts) % 2:   # odd one out carries forward to the next wave
             merged.append(parts[-1])
         parts = merged
-    return _bound_stats(parts[0], capacity)
+    return parts[0]
 
 
 def _merge_chunk(chunk: array[int], pairs_get: Callable[[int], int | None],
                  mult: int) -> None:
     """Apply packed `pairs` to one chunk in place (left-to-right)."""
     last_index = len(chunk) - 1
-    i = 1
+    i = 1  # chunk count is at index 0
     while i < last_index:
         j = i + 1
         token = pairs_get(chunk[i] * mult + chunk[j])
@@ -141,21 +185,21 @@ def get_stats(ids: Iterable[array[int]], mult: int,
     adjacent pair in the hot loop. `mult` must exceed the largest token id
     (vocab_size) so that divmod recovers (first, last).
 
-    When `max_stats_size > 0`, counts are pruned to that many keys whenever the
-    dict grows past 2x the cap (and again at the end), so peak size stays
-    O(max_stats_size). Survivors keep exact counts; pruned keys are dropped.
+    When `max_stats_size > 0`, the lowest exact-count bins are dropped whenever
+    the dict grows past 3x the cap, down to the cap. Finishing a shard does
+    not trim.
 
     Example (mult=1000):
         get_stats([[2, 97, 98, 99], [1, 98, 99, 100], [1, 101, 101, 101]], 1000)
         -> defaultdict(<class 'int'>, {97098: 2, 98099: 3, 99100: 1, 101101: 1})
     """
     counts = defaultdict[int, int](int)
-    soft_limit = max_stats_size * 2 if max_stats_size > 0 else 0
+    soft_limit = max_stats_size * 3 if max_stats_size > 0 else 0
     for chunk in ids:
         _accumulate_chunk_stats(chunk, counts, mult)
         if soft_limit and len(counts) > soft_limit:
             counts = _bound_stats(counts, max_stats_size)
-    return _bound_stats(counts, max_stats_size)
+    return counts
 
 
 def merge_batch_and_get_stats(ids: Iterable[array[int]], pairs: dict[int, int],
@@ -168,14 +212,14 @@ def merge_batch_and_get_stats(ids: Iterable[array[int]], pairs: dict[int, int],
     (not one mixed token-level walk).
     """
     counts = defaultdict[int, int](int)
-    soft_limit = max_stats_size * 2 if max_stats_size > 0 else 0
+    soft_limit = max_stats_size * 3 if max_stats_size > 0 else 0
     pairs_get = pairs.get
     for chunk in ids:
         _merge_chunk(chunk, pairs_get, mult)
         _accumulate_chunk_stats(chunk, counts, mult)
         if soft_limit and len(counts) > soft_limit:
             counts = _bound_stats(counts, max_stats_size)
-    return _bound_stats(counts, max_stats_size)
+    return counts
 
 
 class Corpus(ABC):
@@ -211,8 +255,9 @@ class RamCorpus(Corpus):
     single thread pool is reused for the whole run. Within each shard worker,
     docs are merged then counted one at a time (same control flow as DiskCorpus).
 
-    When `max_stats_size > 0`, pair-count dicts are truncated to that many keys
-    throughout recount/combine (see _bound_stats).
+    When `max_stats_size > 0`, a worker trims mid-walk after exceeding 3x the
+    cap. Finished workers are not trimmed. The combined result is trimmed only
+    if it exceeds 3x the cap (it is the running total).
     """
     def __init__(self, ids: list[array[int]], n: int, max_stats_size: int = 0) -> None:
         self._shards = [*_shards(ids, n)]
@@ -221,15 +266,17 @@ class RamCorpus(Corpus):
 
     def initial_stats(self, mult: int) -> defaultdict[int, int]:
         cap = self._max_stats_size
-        return _combine_counts(list(self._pool.map(
+        combined = _combine_counts(list(self._pool.map(
             lambda shard: get_stats(shard, mult, cap), self._shards)),
-            self._pool, cap)
+            self._pool)
+        return _trim_running_total(combined, cap)
 
     def merge_and_recount(self, pairs_to_merge: dict[int, int], mult: int) -> defaultdict[int, int]:
         cap = self._max_stats_size
-        return _combine_counts(list(self._pool.map(
+        combined = _combine_counts(list(self._pool.map(
             lambda shard: merge_batch_and_get_stats(shard, pairs_to_merge, mult, cap),
-            self._shards)), self._pool, cap)
+            self._shards)), self._pool)
+        return _trim_running_total(combined, cap)
 
     def close(self) -> None:
         self._pool.shutdown()
@@ -265,13 +312,24 @@ def _write_shard(path: str, chunks: list[array[int]] | tuple[array[int], ...]) -
             _append_chunk(f, chunk)
 
 
-def _read_slot_at(f) -> tuple[int, int, array[int]] | None:
-    """Read the next slot. Returns (offset, capacity, chunk) or None at EOF.
+_SLOT_HDR_BYTES = 8  # two uint32 fields: capacity, used
+
+
+def _slot_byte_size(capacity: int) -> int:
+    return _SLOT_HDR_BYTES + capacity * 4
+
+
+def _slot_offset(resume_at: int, capacity: int) -> int:
+    """Byte offset of a slot given the file position after reading it."""
+    return resume_at - _slot_byte_size(capacity)
+
+
+def _read_slot_at(f) -> tuple[int, array[int]] | None:
+    """Read the next slot. Returns (capacity, chunk) or None at EOF.
 
     Leaves the file position at the start of the following slot. `chunk` holds
-    only the live `used` elements (slack is skipped).
+    only the live `used` elements (slack is skipped). Does not call ``tell()``.
     """
-    offset = f.tell()
     hdr = array("I")
     try:
         hdr.fromfile(f, 2)
@@ -279,12 +337,15 @@ def _read_slot_at(f) -> tuple[int, int, array[int]] | None:
         return None
     capacity, used = int(hdr[0]), int(hdr[1])
     if used > capacity:
-        raise ValueError(f"corrupt slot at {offset}: used={used} > capacity={capacity}")
+        pos = f.tell()
+        raise ValueError(
+            f"corrupt slot at {pos - _SLOT_HDR_BYTES}: used={used} > capacity={capacity}"
+        )
     chunk = array("i")
     chunk.fromfile(f, used)
     if capacity > used:
         f.seek((capacity - used) * 4, os.SEEK_CUR)
-    return offset, capacity, chunk
+    return capacity, chunk
 
 
 def _write_slot_inplace(f, offset: int, capacity: int, chunk: array[int],
@@ -304,7 +365,7 @@ def _iter_chunks(f) -> Iterator[array[int]]:
         slot = _read_slot_at(f)
         if slot is None:
             break
-        yield slot[2]
+        yield slot[1]
 
 
 def _iter_shard(path: str) -> Iterator[array[int]]:
@@ -331,8 +392,9 @@ class DiskCorpus(Corpus):
     worker. Build from an in-memory list, or stream with `from_chunk_iter`
     (no full-corpus RAM list).
 
-    When `max_stats_size > 0`, pair-count dicts are truncated to that many keys
-    throughout recount/combine (see _bound_stats).
+    When `max_stats_size > 0`, a worker trims mid-walk after exceeding 3x the
+    cap. Finished workers are not trimmed. The combined result is trimmed only
+    if it exceeds 3x the cap (it is the running total).
     """
 
     def __init__(self, ids: list[array[int]] | None = None, n: int = 1,
@@ -501,7 +563,7 @@ class DiskCorpus(Corpus):
         docs keep their byte offsets (no shard-wide tmp rewrite).
         """
         cap = self._max_stats_size
-        soft_limit = cap * 2 if cap > 0 else 0
+        soft_limit = cap * 3 if cap > 0 else 0
         counts = defaultdict[int, int](int)
         pairs_get = pairs.get
         with open(path, "r+b") as f:
@@ -509,16 +571,17 @@ class DiskCorpus(Corpus):
                 slot = _read_slot_at(f)
                 if slot is None:
                     break
-                offset, capacity, chunk = slot
-                resume_at = f.tell()
+                capacity, chunk = slot
                 n_before = len(chunk)
                 _merge_chunk(chunk, pairs_get, mult)
                 _accumulate_chunk_stats(chunk, counts, mult)
                 if soft_limit and len(counts) > soft_limit:
                     counts = _bound_stats(counts, cap)
                 if len(chunk) != n_before:
-                    _write_slot_inplace(f, offset, capacity, chunk, resume_at)
-        return _bound_stats(counts, cap)
+                    resume_at = f.tell()
+                    _write_slot_inplace(
+                        f, _slot_offset(resume_at, capacity), capacity, chunk, resume_at)
+        return counts
 
     def _reduce_paths(self, fn) -> defaultdict[int, int]:
         """Run `fn` on every shard with work-stealing; combine in waves of `n`.
@@ -527,10 +590,10 @@ class DiskCorpus(Corpus):
         next pending shard is submitted immediately (no barrier). Completed
         count-dicts are buffered and tree-combined in batches of `n_workers`
         via `_combine_counts` — same combine cardinality as the old wave
-        scheduler — then folded into a running total. Batch combines run on
-        the caller thread so they do not contend with in-flight shard tasks on
-        the pool. When `max_stats_size > 0`, each combine/fold truncates so
-        peak stats RAM stays O(max_stats_size).
+        scheduler — then folded into a running total. Pair-merges in the
+        combine tree run on the worker pool. A wave of finished shards is
+        summed without trimming, then folded into the running total; that
+        total is trimmed only when it exceeds 3x `max_stats_size`.
         """
         paths = self._shard_paths
         if not paths:
@@ -550,11 +613,9 @@ class DiskCorpus(Corpus):
 
         def _fold_batch(batch: list[defaultdict[int, int]],
                         total: defaultdict[int, int] | None) -> defaultdict[int, int]:
-            # pool=None: combine on this thread so shard workers keep stealing.
-            wave_total = (_combine_counts(batch, None, cap)
-                          if len(batch) > 1 else _bound_stats(batch[0], cap))
-            return (wave_total if total is None
-                    else _bound_stats(_merge_two(total, wave_total), cap))
+            wave = _combine_counts(batch, self._pool)
+            combined = wave if total is None else _merge_two(total, wave)
+            return _trim_running_total(combined, cap)
 
         _fill()
         buffer: list[defaultdict[int, int]] = []
@@ -564,14 +625,15 @@ class DiskCorpus(Corpus):
             for fut in done:
                 in_flight.remove(fut)
                 buffer.append(fut.result())
-            # Combine before refill so we release batch dicts promptly.
+            # Refill workers before folding so shard I/O/CPU stays overlapped
+            # with the (serial) combine of completed count-dicts.
+            _fill()
             while len(buffer) >= n:
                 total = _fold_batch(buffer[:n], total)
                 del buffer[:n]
-            _fill()
+                _fill()
         if buffer:
             total = _fold_batch(buffer, total)
-        assert total is not None
         return total
 
     def initial_stats(self, mult: int) -> defaultdict[int, int]:

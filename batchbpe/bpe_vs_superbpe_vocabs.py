@@ -23,8 +23,9 @@ from batchbpe.base import GPT4_SPLIT_PATTERN
 
 repo_root = Path(__file__).resolve().parents[1]
 models_dir = repo_root / "models"
-corpus_checkpoint = repo_root / "superbpe_corpus_checkpoint"
-corpus_manifest = corpus_checkpoint / "manifest.json"
+# Fresh SuperBPE-from-BPE-90% import. Do not reuse superbpe_corpus_checkpoint:
+# that directory was merged in place by the interrupted SuperBPE run.
+corpus_checkpoint = repo_root / "superbpe_from_bpe90_checkpoint"
 
 ninety_percent_size = 45298
 final_size = 50304
@@ -48,34 +49,19 @@ superbpe.load(
 superbpe.set_pattern(None)
 superbpe.set_import_encoding_pattern(GPT4_SPLIT_PATTERN)
 
-if corpus_manifest.is_file():
-    # The expensive 10B-token import is already complete. `data` is unused when
-    # resuming because the manifest names every existing tokenized shard.
-    training_data = None
-    resume_from_manifest = str(corpus_checkpoint)
-    work_dir = None
-elif corpus_checkpoint.exists():
-    raise RuntimeError(
-        f"Incomplete corpus checkpoint (manifest missing): {corpus_checkpoint}"
-    )
-else:
-    training_data = load_dataset(
-        "HuggingFaceFW/fineweb-edu",
-        name="sample-10BT",
-        split="train",
-        streaming=True,
-    )
-    resume_from_manifest = None
-    # An explicit work directory preserves the completed imported corpus.
-    work_dir = str(corpus_checkpoint)
+training_data = load_dataset(
+    "HuggingFaceFW/fineweb-edu",
+    name="sample-10BT",
+    split="train",
+    streaming=True,
+)
 
 superbpe.train(
     training_data,
     vocab_size=final_size,
     backend="disk",
-    work_dir=work_dir,
+    work_dir=str(corpus_checkpoint),
     memory_efficient=True,
     records_per_shard=10_000,
-    resume_from_manifest=resume_from_manifest,
     verbose=True)
 superbpe.save(str(models_dir / f"FWEdu10B_superbpe_size_{final_size}_freq_cutoff_64"))

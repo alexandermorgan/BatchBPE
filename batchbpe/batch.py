@@ -41,7 +41,7 @@ class BatchTokenizer(Tokenizer):
         - max_batch_size: hard cap on merges per batch; 0 = no cap beyond remaining.
         - backend: "ram" (in-memory) or "disk" (sharded corpus for large data).
         - work_dir: working directory for the "disk" backend; temp dir if omitted.
-        - memory_efficient: cap pair-count dicts near vocab_size (less RAM, may differ slightly).
+        - memory_efficient: cap pair-count dicts near 4x vocab_size (less RAM, may differ slightly).
         - records_per_shard: disk-backend chunk buffer size; lower values use less
           import RAM but create more shard files. Required for bounded streaming
           input: use backend="disk" and dedup=False.
@@ -71,7 +71,7 @@ class BatchTokenizer(Tokenizer):
             )
 
         encode_with_vocab = bool(self.merges)
-        max_stats_size = vocab_size*5 if memory_efficient else 0
+        max_stats_size = vocab_size * 4 if memory_efficient else 0
         t0 = time.time()
 
         if backend == "disk":
