@@ -42,6 +42,15 @@ import os
 import shutil
 import tempfile
 
+try:
+    from batchbpe import _native as _rust
+except ImportError:
+    _rust = None
+
+
+def _counts_from_rust(d: dict[int, int]) -> defaultdict[int, int]:
+    return defaultdict(int, d)
+
 
 def _shards(seq: list[array[int]], n: int) -> batched[tuple[array[int], ...]]:
     """Split `seq` into at most `n` contiguous batches for parallel workers."""
@@ -50,11 +59,13 @@ def _shards(seq: list[array[int]], n: int) -> batched[tuple[array[int], ...]]:
 
 
 def _bin_to_capacity(counts: defaultdict[int, int], capacity: int) -> defaultdict[int, int]:
-    """Drop lowest exact-count bins until `len(counts) == capacity`.
+    """Drop lowest exact-count bins until `len(counts) == capacity`."""
+    if _rust is not None:
+        return _counts_from_rust(_rust.bin_to_capacity_py(dict(counts), capacity))
+    return _bin_to_capacity_py(counts, capacity)
 
-    Each exact count is its own bin (``list`` of packed ids). Dropped bins store
-    keys only. Kept keys are copied into a fresh dict with a plain loop.
-    """
+
+def _bin_to_capacity_py(counts: defaultdict[int, int], capacity: int) -> defaultdict[int, int]:
     remaining = len(counts) - capacity
     if remaining <= 0:
         return counts
@@ -114,15 +125,18 @@ def _merge_two(a: defaultdict[int, int], b: defaultdict[int, int]) -> defaultdic
 
 def _combine_counts(parts: list[defaultdict[int, int]], pool: ThreadPoolExecutor | None,
                     ) -> defaultdict[int, int]:
-    """Sum a list of packed-int count dicts into one (the global pair stats).
+    """Sum a list of packed-int count dicts into one (the global pair stats)."""
+    if _rust is not None and parts:
+        parallel = pool is not None and len(parts) > 1
+        return _counts_from_rust(
+            _rust.combine_counts_py([dict(p) for p in parts], parallel=parallel)
+        )
+    return _combine_counts_py(parts, pool)
 
-    Reduced as a balanced binary tree: each wave merges disjoint pairs of dicts,
-    halving the count per wave, so the merge depth is ceil(log2(len(parts)))
-    waves (e.g. 8 shards -> 3, 16 -> 4, 32 -> 5) instead of len(parts)-1 serial
-    merges. When `pool` is set, each wave runs concurrently on it; when `pool`
-    is None, merges run on the caller thread. Does not trim; the caller folds
-    into the running total and trims that dict if it exceeds 3x cap.
-    """
+
+def _combine_counts_py(parts: list[defaultdict[int, int]], pool: ThreadPoolExecutor | None,
+                       ) -> defaultdict[int, int]:
+    """Python tree combine for count dicts."""
     if not parts:
         return defaultdict[int, int](int)
     while len(parts) > 1:
@@ -173,26 +187,19 @@ def get_stats(ids: Iterable[array[int]], mult: int,
               max_stats_size: int = 0) -> defaultdict[int, int]:
     """
     Given `ids`, an iterable of chunks where each chunk contains a count as the
-    FIRST element followed by tokens, returns a defaultdict with the
-    counts of occurrences of all consecutive pairs of integers within each
-    list, multiplied by the count value. Consecutive identical pairs within
-    the same list are counted only once to avoid overcounting repeat characters.
+    FIRST element followed by tokens, returns pair counts keyed by packed ids.
 
-    Chunks are consumed one at a time (friendly to generators / disk streams).
-
-    Pairs are keyed by the packed int `first*mult + last` instead of a
-    `(first, last)` tuple, which avoids allocating a throwaway tuple for every
-    adjacent pair in the hot loop. `mult` must exceed the largest token id
-    (vocab_size) so that divmod recovers (first, last).
-
-    When `max_stats_size > 0`, the lowest exact-count bins are dropped whenever
-    the dict grows past 3x the cap, down to the cap. Finishing a shard does
-    not trim.
-
-    Example (mult=1000):
-        get_stats([[2, 97, 98, 99], [1, 98, 99, 100], [1, 101, 101, 101]], 1000)
-        -> defaultdict(<class 'int'>, {97098: 2, 98099: 3, 99100: 1, 101101: 1})
+    When `max_stats_size > 0`, lowest exact-count bins drop whenever the dict
+    grows past 3x the cap. Finishing a shard does not trim.
     """
+    if _rust is not None:
+        if isinstance(ids, list | tuple):
+            chunk_list = list(ids)
+        else:
+            chunk_list = list(ids)
+        return _counts_from_rust(
+            _rust.stats_from_chunks_py(chunk_list, mult, max_stats_size)
+        )
     counts = defaultdict[int, int](int)
     soft_limit = max_stats_size * 3 if max_stats_size > 0 else 0
     for chunk in ids:
@@ -211,6 +218,11 @@ def merge_batch_and_get_stats(ids: Iterable[array[int]], pairs: dict[int, int],
     `first*mult + last`. Merge and recount stay separate tight loops per doc
     (not one mixed token-level walk).
     """
+    if _rust is not None:
+        chunk_list = list(ids)
+        return _counts_from_rust(
+            _rust.merge_chunks_py(chunk_list, pairs, mult, max_stats_size)
+        )
     counts = defaultdict[int, int](int)
     soft_limit = max_stats_size * 3 if max_stats_size > 0 else 0
     pairs_get = pairs.get
@@ -266,6 +278,10 @@ class RamCorpus(Corpus):
 
     def initial_stats(self, mult: int) -> defaultdict[int, int]:
         cap = self._max_stats_size
+        if _rust is not None:
+            return _counts_from_rust(
+                _rust.reduce_memory_shards_py(list(self._shards), mult, cap, None)
+            )
         combined = _combine_counts(list(self._pool.map(
             lambda shard: get_stats(shard, mult, cap), self._shards)),
             self._pool)
@@ -273,6 +289,11 @@ class RamCorpus(Corpus):
 
     def merge_and_recount(self, pairs_to_merge: dict[int, int], mult: int) -> defaultdict[int, int]:
         cap = self._max_stats_size
+        if _rust is not None:
+            return _counts_from_rust(
+                _rust.reduce_memory_shards_py(
+                    list(self._shards), mult, cap, pairs_to_merge)
+            )
         combined = _combine_counts(list(self._pool.map(
             lambda shard: merge_batch_and_get_stats(shard, pairs_to_merge, mult, cap),
             self._shards)), self._pool)
@@ -552,6 +573,10 @@ class DiskCorpus(Corpus):
         return paths
 
     def _stats_from_path(self, path: str, mult: int) -> defaultdict[int, int]:
+        if _rust is not None:
+            return _counts_from_rust(
+                _rust.stats_from_shard_path_py(path, mult, self._max_stats_size)
+            )
         return get_stats(_iter_shard(path), mult, self._max_stats_size)
 
     def _merge_from_path(self, path: str, pairs: dict[int, int],
@@ -562,6 +587,10 @@ class DiskCorpus(Corpus):
         docs are written back into their fixed-capacity slot in place so later
         docs keep their byte offsets (no shard-wide tmp rewrite).
         """
+        if _rust is not None:
+            return _counts_from_rust(
+                _rust.merge_shard_path_py(path, pairs, mult, self._max_stats_size)
+            )
         cap = self._max_stats_size
         soft_limit = cap * 3 if cap > 0 else 0
         counts = defaultdict[int, int](int)
@@ -637,9 +666,20 @@ class DiskCorpus(Corpus):
         return total
 
     def initial_stats(self, mult: int) -> defaultdict[int, int]:
+        if _rust is not None:
+            return _counts_from_rust(
+                _rust.reduce_shard_paths_py(
+                    self._shard_paths, mult, self._max_stats_size, self._n_workers, None)
+            )
         return self._reduce_paths(lambda path: self._stats_from_path(path, mult))
 
     def merge_and_recount(self, pairs_to_merge: dict[int, int], mult: int) -> defaultdict[int, int]:
+        if _rust is not None:
+            return _counts_from_rust(
+                _rust.reduce_shard_paths_py(
+                    self._shard_paths, mult, self._max_stats_size, self._n_workers,
+                    pairs_to_merge)
+            )
         return self._reduce_paths(
             lambda path: self._merge_from_path(path, pairs_to_merge, mult))
 

@@ -116,6 +116,9 @@ def test_dead_utf8_bytes_are_reclaimed_by_early_merges():
 
     assert list(tokenizer.merges.values()) == [192, 193, 245]
     assert set(range(256)) - set(tokenizer.vocab) == set(range(246, 256))
+    # Rust HashMap export used to shuffle this; save() writes .vocab in dict order.
+    assert list(tokenizer.vocab)[:192] == list(range(192))
+    assert list(tokenizer.vocab)[-3:] == [192, 193, 245]
 
 
 def test_stop_words_reclaim_dead_utf8_bytes_first():
@@ -378,8 +381,12 @@ def test_ram_backend_deduplicates_text_record_streams():
     streamed = BatchTokenizer(pattern=None, multiprocess=False, dedup=True)
     streamed.train(records(), vocab_size, backend="ram")
 
-    assert len(streamed._corpus_ids) == 2
-    assert sorted(chunk[0] for chunk in streamed._corpus_ids) == [1, 2]
+    if streamed._rust_corpus is not None:
+        assert len(streamed._rust_corpus) == 2
+        assert sorted(streamed._rust_corpus.chunk_counts()) == [1, 2]
+    else:
+        assert len(streamed._corpus_ids) == 2
+        assert sorted(chunk[0] for chunk in streamed._corpus_ids) == [1, 2]
     assert streamed.merges == expected.merges
     assert streamed.vocab == expected.vocab
 

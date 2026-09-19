@@ -684,9 +684,9 @@ class Tokenizer:
         model_file = file_prefix + ".model"
         with open(model_file, 'w') as f:
             # write the version, pattern and merges, that's all that's needed
-            f.write("BatchBPE v1\n")
+            f.write("BatchBPE v2\n")
             # open-field (pattern is None) is written as an empty line
-            f.write(f"{self.pattern if self.pattern is not None else ''}\n")
+            f.write(f"{self.pattern if self.pattern is not None else ''}")
             # write the special tokens, first the number of them, then each one
             f.write(f"{len(self.special_tokens)}\n")
             for special, idx in self.special_tokens.items():
@@ -731,7 +731,6 @@ class Tokenizer:
         with open(model_file, 'r', encoding="utf-8") as f:
             # read the version
             version = f.readline().strip()
-            assert version == "BatchBPE v1"
             # read the pattern (an empty line means open-field / no splitting)
             self.pattern = f.readline().strip() or None
             # read the special tokens

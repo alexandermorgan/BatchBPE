@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "batchbpe"
@@ -26,7 +26,12 @@ dependencies = [
 dev = [
     "pytest",
     "matplotlib",
+    "maturin>=1.7",
 ]
 
-[tool.setuptools]
-packages = ["batchbpe"] 
+[tool.maturin]
+module-name = "batchbpe._native"
+python-source = "."
+
+[tool.setuptools.packages.find]
+include = ["batchbpe*"]

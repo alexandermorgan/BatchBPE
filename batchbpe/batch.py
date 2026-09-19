@@ -9,6 +9,11 @@ from .corpus import Corpus, DiskCorpus, RamCorpus
 from heapq import nlargest
 import time
 
+try:
+    from batchbpe import _native as _rust
+except ImportError:
+    _rust = None
+
 
 class BatchTokenizer(Tokenizer):
     def __init__(self, pattern=GPT4_SPLIT_PATTERN, multiprocess: bool = True, store_dict: bool = False,
@@ -23,7 +28,42 @@ class BatchTokenizer(Tokenizer):
         """
         super().__init__(pattern, multiprocess, store_dict, stop_list_size, freq_cutoff, dedup)
         self._corpus_ids = None
+        self._rust_corpus = None
         self._corpus_pattern = None
+
+    def _rust_merge_kwargs(self, vocab_size: int, cap_divisor: int,
+                           max_batch_size: int, verbose: bool = False) -> dict:
+        return dict(
+            vocab_size=vocab_size,
+            cap_divisor=cap_divisor,
+            max_batch_size=max_batch_size,
+            initial_vocab=self.vocab,
+            initial_merges=self.merges,
+            special_token_ids=list(self.special_tokens.values()),
+            vocab_id_cursor=self._vocab_id_cursor,
+            n_special=len(self.special_tokens),
+            verbose=verbose,
+        )
+
+    def _apply_rust_merge_result(self, merges, vocab, cursor, batch_count,
+                                 t1: float, verbose: bool) -> None:
+        self.merges = dict(merges)
+        self.vocab = dict(vocab)
+        self._vocab_id_cursor = cursor
+        self._invalidate_encoding_caches()
+        # Per-batch logs are emitted inside the Rust merge loop when verbose=True.
+        if verbose and batch_count:
+            print(
+                f"Completed {batch_count} merge batches in "
+                f"{time.time() - t1:.2f} sec.",
+                flush=True,
+            )
+
+    def _run_rust_corpus_merges(self, corpus, vocab_size: int, cap_divisor: int,
+                                max_batch_size: int, t1: float, verbose: bool) -> None:
+        result = corpus.build_merges(**self._rust_merge_kwargs(
+            vocab_size, cap_divisor, max_batch_size, verbose=verbose))
+        self._apply_rust_merge_result(*result, t1, verbose)
 
     def train(self, data, vocab_size: int, cap_divisor: int = 2,
               max_batch_size: int = 0, backend: str = "ram", work_dir: str | None = None,
@@ -76,7 +116,59 @@ class BatchTokenizer(Tokenizer):
 
         if backend == "disk":
             self._corpus_ids = None
+            self._rust_corpus = None
             self._corpus_pattern = None
+            if _rust is not None:
+                if resume_from_manifest is not None:
+                    disk = _rust.DiskCorpus.from_manifest(
+                        resume_from_manifest, self._cpus, max_stats_size)
+                    t1 = time.time()
+                    print(
+                        f"Resuming disk corpus from {resume_from_manifest} "
+                        f"({len(disk):,} shards)"
+                    )
+                    self._run_rust_corpus_merges(
+                        disk, vocab_size, cap_divisor, max_batch_size, t1, verbose)
+                    return
+                if self.dedup:
+                    ids = self._import_data(data, encode_with_vocab=encode_with_vocab)
+                    t1 = time.time()
+                    print(f'Time spent loading data: {t1-t0:.2f}s')
+                    with DiskCorpus(ids, self._cpus, work_dir,
+                                    max_stats_size=max_stats_size) as py_corpus:
+                        del ids
+                        if isinstance(data, list):
+                            data.clear()
+                        disk = _rust.DiskCorpus(
+                            py_corpus._shard_paths,
+                            py_corpus._n_workers,
+                            max_stats_size,
+                        )
+                        self._run_rust_corpus_merges(
+                            disk, vocab_size, cap_divisor, max_batch_size, t1, verbose)
+                    return
+                corpus_kwargs = {"max_stats_size": max_stats_size}
+                if records_per_shard is not None:
+                    corpus_kwargs["records_per_shard"] = records_per_shard
+                py_corpus = DiskCorpus.from_chunk_iter(
+                    self._iter_chunk_arrays(data, encode_with_vocab=encode_with_vocab),
+                    self._cpus, work_dir, **corpus_kwargs)
+                if isinstance(data, list):
+                    data.clear()
+                t1 = time.time()
+                print(f'Time spent loading data: {t1-t0:.2f}s')
+                try:
+                    disk = _rust.DiskCorpus(
+                        py_corpus._shard_paths,
+                        py_corpus._n_workers,
+                        max_stats_size,
+                    )
+                    self._run_rust_corpus_merges(
+                        disk, vocab_size, cap_divisor, max_batch_size, t1, verbose)
+                finally:
+                    py_corpus.close()
+                return
+
             if resume_from_manifest is not None:
                 corpus = DiskCorpus.from_manifest(
                     resume_from_manifest,
@@ -104,13 +196,11 @@ class BatchTokenizer(Tokenizer):
                 print(f'Time spent loading data: {t1-t0:.2f}s')
                 with DiskCorpus(ids, self._cpus, work_dir,
                                 max_stats_size=max_stats_size) as corpus:
-                    del ids  # shards are on disk; free the in-RAM chunk list
+                    del ids
                     if isinstance(data, list):
-                        data.clear()  # free source strings before the merge loop
+                        data.clear()
                     self._build_merges(corpus, vocab_size, cap_divisor, max_batch_size, t1, verbose)
             else:
-                # Stream chunks straight to shards — never build a full Counter
-                # or in-RAM list of arrays.
                 corpus_kwargs = {"max_stats_size": max_stats_size}
                 if records_per_shard is not None:
                     corpus_kwargs["records_per_shard"] = records_per_shard
@@ -118,11 +208,31 @@ class BatchTokenizer(Tokenizer):
                     self._iter_chunk_arrays(data, encode_with_vocab=encode_with_vocab),
                     self._cpus, work_dir, **corpus_kwargs)
                 if isinstance(data, list):
-                    data.clear()  # free source strings before the merge loop
+                    data.clear()
                 t1 = time.time()
                 print(f'Time spent loading data: {t1-t0:.2f}s')
                 with corpus:
                     self._build_merges(corpus, vocab_size, cap_divisor, max_batch_size, t1, verbose)
+            return
+
+        if _rust is not None:
+            same_wave = (
+                self._rust_corpus is not None
+                and self.pattern == self._corpus_pattern
+            )
+            if same_wave:
+                print('Reusing in-memory corpus (same split pattern).')
+            else:
+                ids = self._import_data(data, encode_with_vocab=encode_with_vocab)
+                self._rust_corpus = _rust.RamCorpus(
+                    ids, self._cpus, max_stats_size)
+                del ids
+                self._corpus_pattern = self.pattern
+            t1 = time.time()
+            if not same_wave:
+                print(f'Time spent loading data: {t1-t0:.2f}s')
+            self._run_rust_corpus_merges(
+                self._rust_corpus, vocab_size, cap_divisor, max_batch_size, t1, verbose)
             return
 
         same_wave = (
@@ -146,17 +256,7 @@ class BatchTokenizer(Tokenizer):
     def _build_merges(self, corpus: Corpus, vocab_size: int, cap_divisor: int,
                       max_batch_size: int, t1: float, verbose: bool) -> None:
         """
-        Run the batched BPE merge loop against any Corpus backend. This is the
-        backend-agnostic core: it only asks `corpus` for the initial pair counts
-        and for a merge-batch-then-recount each wave; where the chunk data lives
-        and how the work is parallelized is the backend's concern.
-
-        - corpus: Corpus backend holding tokenized chunks (RAM or disk).
-        - vocab_size: target vocabulary size to grow toward.
-        - cap_divisor: divides remaining merges to size each batch.
-        - max_batch_size: hard cap on merges per batch; <1 means use all remaining.
-        - t1: start timestamp for verbose batch timing.
-        - verbose: print per-batch progress.
+        Python fallback merge loop when the native extension is unavailable.
         """
         merges = self.merges   # {(int, int): int} -> token pair to new token
         vocab = self.vocab   # {int: bytes} -> token to its bytes representation
